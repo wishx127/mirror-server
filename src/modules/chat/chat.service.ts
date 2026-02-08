@@ -33,7 +33,7 @@ interface StoredImageMetadata {
   width?: number;
   height?: number;
   ratio?: string;
-  localPath: string;
+  localPath?: string;
   url: string;
   uploadedAt: string;
 }
@@ -44,10 +44,27 @@ interface ImageContentPart {
   data: StoredImageMetadata;
 }
 
-// 存储的消息格式（支持图片）
+// 存储的文件元数据
+interface StoredFileMetadata {
+  fileName: string;
+  mimeType: string;
+  size: number;
+  url: string;
+  uploadedAt: string;
+}
+
+// 文件内容片段类型
+interface FileContentPart {
+  type: "file";
+  data: StoredFileMetadata;
+}
+
+// 存储的消息格式（支持图片和文件）
 interface StoredMessage {
   role: "system" | "user" | "assistant";
-  content: string | StoredMessageContentPart[] | ImageContentPart[];
+  content:
+    | string
+    | (StoredMessageContentPart | ImageContentPart | FileContentPart)[];
   key?: string;
   time?: string;
   reasoning_content?: string;
@@ -208,46 +225,7 @@ export class ChatService {
     // 2. 确定 chatId 和获取上下文
     let chatId = dto.chatId;
     let isNewConversation = false;
-
-    // 获取用户选择的角色prompt，如果没有则使用默认
-    let systemContent = userId
-      ? await this.roleService.getUserSystemPrompt(userId)
-      : "你是一个专业、精准、高效的智能问答助手，名字叫Mirror。";
-
-    // 3. 知识库检索
-    if (dto.enableKnowledge && userId) {
-      const searchResult = await this.knowledgeService.search(
-        userId,
-        dto.content,
-        dto.topK ?? 5,
-        dto.minSimilarity ?? 0.2,
-      );
-      if (searchResult.success && searchResult.results.length > 0) {
-        const knowledgeContext = `
-          ## 参考资料（按相关性排序）
-          ${searchResult.results
-            .map(
-              (res, i) => `
-            ### 资料 ${i + 1} [相似度: ${(res.similarity * 100).toFixed(1)}%]
-              - 来源: ${res.fileName}
-              - 内容: ${res.content}
-            `,
-            )
-            .join("\n\n")}
-          ## 回答要求
-            1. 优先使用上述参考资料回答
-            2. 若资料不足，可结合自身知识补充
-        `;
-        systemContent += `\n\n以下是与用户问题相关的参考资料，请优先根据这些内容进行回答，若资料不足以回答问题，请根据自己的知识进行回答：\n\n${knowledgeContext}`;
-      }
-    }
-
-    const messages: ChatMessage[] = [
-      {
-        role: "system",
-        content: systemContent,
-      },
-    ];
+    const messages: ChatMessage[] = [];
 
     if (userId) {
       if (chatId) {
@@ -307,6 +285,7 @@ export class ChatService {
                 const contentParts = storedMsg.content as unknown as (
                   | StoredMessageContentPart
                   | ImageContentPart
+                  | FileContentPart
                 )[];
                 contentParts.forEach((part) => {
                   if (part.type === "thinking") reasoningContent += part.data;
@@ -314,6 +293,10 @@ export class ChatService {
                   if (part.type === "image") {
                     const imagePart = part as unknown as ImageContentPart;
                     imageUrls.push(imagePart.data.url);
+                  }
+                  if (part.type === "file") {
+                    const filePart = part as unknown as FileContentPart;
+                    combinedContent += `\n\n文件: ${filePart.data.fileName}\n链接: ${filePart.data.url}`;
                   }
                 });
                 messages.push({
@@ -331,12 +314,17 @@ export class ChatService {
                 const contentParts = storedMsg.content as unknown as (
                   | StoredMessageContentPart
                   | ImageContentPart
+                  | FileContentPart
                 )[];
                 contentParts.forEach((part) => {
                   if (part.type === "content") combinedContent += part.data;
                   if (part.type === "image") {
                     const imagePart = part as unknown as ImageContentPart;
                     imageUrls.push(imagePart.data.url);
+                  }
+                  if (part.type === "file") {
+                    const filePart = part as unknown as FileContentPart;
+                    combinedContent += `\n\n文件: ${filePart.data.fileName}\n链接: ${filePart.data.url}`;
                   }
                 });
                 messages.push({
@@ -381,41 +369,177 @@ export class ChatService {
       chatId = "";
     }
 
+    // 获取系统提示词 (动态获取用户当前选择的角色)
+    let systemContent =
+      "你是一个专业、精准、高效的智能问答助手，名字叫Mirror。";
+    if (userId) {
+      systemContent = await this.roleService.getUserSystemPrompt(userId);
+    }
+
+    // 3. 知识库检索
+    if (dto.enableKnowledge && userId) {
+      const searchResult = await this.knowledgeService.search(
+        userId,
+        dto.content,
+        dto.topK ?? 5,
+        dto.minSimilarity ?? 0.2,
+      );
+      if (searchResult.success && searchResult.results.length > 0) {
+        const knowledgeContext = `
+          ## 参考资料（按相关性排序）
+          ${searchResult.results
+            .map(
+              (res, i) => `
+            ### 资料 ${i + 1} [相似度: ${(res.similarity * 100).toFixed(1)}%]
+              - 来源: ${res.fileName}
+              - 内容: ${res.content}
+            `,
+            )
+            .join("\n\n")}
+          ## 回答要求
+            1. 优先使用上述参考资料回答
+            2. 若资料不足，可结合自身知识补充
+        `;
+        systemContent += `\n\n以下是与用户问题相关的参考资料，请优先根据这些内容进行回答，若资料不足以回答问题，请根据自己的知识进行回答：\n\n${knowledgeContext}`;
+      }
+    }
+
+    messages.unshift({
+      role: "system",
+      content: systemContent,
+    });
+
     // 构建用户消息内容（支持多模态）
     const userContentParts: MessageContentPart[] = [];
+
+    // 添加文本内容
+    let finalContent = dto.content;
+
+    // 准备存储的消息内容片段
+    const userMessageContent: (
+      | StoredMessageContentPart
+      | ImageContentPart
+      | FileContentPart
+    )[] = [];
 
     // 添加图像
     if (dto.images && dto.images.length > 0) {
       for (const image of dto.images) {
         let imageUrl: string | undefined;
+        let imageBase64: string | undefined;
+        let mimeType = "image/png";
+        let fileName = `image-${Date.now()}-${this.getRandomKey()}.png`;
 
         if (typeof image === "string") {
           imageUrl = image;
+          if (image.startsWith("data:")) {
+            const matches = image.match(/^data:(.+);base64,(.+)$/);
+            if (matches) {
+              mimeType = matches[1];
+              imageBase64 = matches[2];
+              const extension = mimeType.split("/")[1] || "png";
+              fileName = `image-${Date.now()}-${this.getRandomKey()}.${extension}`;
+            }
+          }
         } else if (typeof image === "object" && image !== null) {
-          imageUrl = image.url || image.base64;
+          imageUrl = image.url;
+          imageBase64 = image.base64;
+          mimeType = image.mimeType || "image/png";
+          const extension = mimeType.split("/")[1] || "png";
+          fileName = `image-${Date.now()}-${this.getRandomKey()}.${extension}`;
         }
 
-        if (imageUrl) {
-          if (!imageUrl.startsWith("http") && !imageUrl.startsWith("data:")) {
-            const mimeType =
-              typeof image === "object" && image.mimeType
-                ? image.mimeType
-                : "image/png";
-            imageUrl = `data:${mimeType};base64,${imageUrl}`;
-          }
+        if (imageUrl || imageBase64) {
+          let finalImageUrl = imageUrl;
 
-          userContentParts.push({
-            type: "image_url",
-            image_url: {
-              url: imageUrl,
-            },
-          });
+          if (imageBase64 || (imageUrl && imageUrl.startsWith("data:"))) {
+            const dataToUpload =
+              imageBase64 ||
+              (imageUrl && imageUrl.startsWith("data:")
+                ? imageUrl.split(",")[1]
+                : "");
+            if (dataToUpload) {
+              try {
+                const uploadResult = await this.uploadToSupabase(
+                  dataToUpload,
+                  fileName,
+                  mimeType,
+                );
+                finalImageUrl = uploadResult.url;
+                fileName = uploadResult.fileName;
+                mimeType = uploadResult.mimeType;
+                const size = uploadResult.size;
+
+                if (finalImageUrl) {
+                  userContentParts.push({
+                    type: "image_url",
+                    image_url: {
+                      url: finalImageUrl,
+                    },
+                  });
+
+                  // 添加到存储的消息
+                  userMessageContent.push({
+                    type: "image",
+                    data: {
+                      fileName,
+                      mimeType,
+                      size,
+                      url: finalImageUrl,
+                      uploadedAt: this.formatChineseTime(new Date()),
+                    },
+                  });
+                }
+              } catch (error) {
+                console.error("图片上传失败:", error);
+                finalImageUrl =
+                  imageUrl || `data:${mimeType};base64,${imageBase64}`;
+
+                if (finalImageUrl) {
+                  userContentParts.push({
+                    type: "image_url",
+                    image_url: {
+                      url: finalImageUrl,
+                    },
+                  });
+
+                  // 添加到存储的消息
+                  userMessageContent.push({
+                    type: "image",
+                    data: {
+                      fileName,
+                      mimeType,
+                      size: 0,
+                      url: finalImageUrl,
+                      uploadedAt: this.formatChineseTime(new Date()),
+                    },
+                  });
+                }
+              }
+            }
+          } else if (finalImageUrl) {
+            userContentParts.push({
+              type: "image_url",
+              image_url: {
+                url: finalImageUrl,
+              },
+            });
+
+            // 添加到存储的消息
+            userMessageContent.push({
+              type: "image",
+              data: {
+                fileName,
+                mimeType,
+                size: 0,
+                url: finalImageUrl,
+                uploadedAt: this.formatChineseTime(new Date()),
+              },
+            });
+          }
         }
       }
     }
-
-    // 添加文本内容
-    let finalContent = dto.content;
 
     // 添加文件内容
     if (dto.files && dto.files.length > 0) {
@@ -427,7 +551,37 @@ export class ChatService {
           filesText += `大小: ${(file.size / 1024).toFixed(2)} KB\n`;
         }
         filesText += `内容:\n${file.content}\n`;
-        filesText += "---\n";
+        filesText += "---";
+
+        // 上传文件到 Supabase
+        try {
+          // 如果 content 是 base64 (通常对于二进制文件)，则直接上传
+          // 如果是纯文本，也先转成 base64 上传
+          const isBase64 = /^[A-Za-z0-9+/]*={0,2}$/.test(file.content);
+          const base64Data = isBase64
+            ? file.content
+            : Buffer.from(file.content).toString("base64");
+
+          const uploadResult = await this.uploadToSupabase(
+            base64Data,
+            file.fileName,
+            file.mimeType,
+          );
+
+          // 添加到存储的消息
+          userMessageContent.push({
+            type: "file",
+            data: {
+              fileName: uploadResult.fileName,
+              mimeType: uploadResult.mimeType,
+              size: uploadResult.size,
+              url: uploadResult.url,
+              uploadedAt: this.formatChineseTime(new Date()),
+            },
+          });
+        } catch (error) {
+          console.error(`文件 ${file.fileName} 上传失败:`, error);
+        }
       }
       finalContent += filesText;
     }
@@ -437,14 +591,14 @@ export class ChatService {
       text: finalContent,
     });
 
+    userMessageContent.push({
+      type: "content",
+      data: dto.content,
+    });
+
     const userMessage: StoredMessage = {
       role: "user",
-      content: [
-        {
-          type: "content",
-          data: dto.content,
-        },
-      ],
+      content: userMessageContent,
       key: this.getRandomKey(),
       time: this.formatChineseTime(new Date()),
     };
@@ -616,6 +770,131 @@ export class ChatService {
   }
 
   /**
+   * 压缩图片
+   * @param buffer 图片 Buffer
+   * @param mimeType MIME 类型
+   * @returns 压缩后的 Buffer 和新的 MIME 类型
+   */
+  private async compressImage(
+    buffer: Buffer,
+    mimeType: string,
+  ): Promise<{ buffer: Buffer; mimeType: string }> {
+    if (
+      !mimeType.startsWith("image/") ||
+      mimeType === "image/gif" ||
+      mimeType === "image/svg+xml" ||
+      mimeType === "image/webp"
+    ) {
+      return { buffer, mimeType };
+    }
+
+    try {
+      const sharpModule = await import("sharp");
+      const sharp = sharpModule.default;
+
+      let pipeline = sharp(buffer);
+      const metadata = await pipeline.metadata();
+
+      // 如果图片过大，进行等比例缩放，最大宽度 2048
+      if (metadata.width && metadata.width > 2048) {
+        pipeline = pipeline.resize(2048, null, {
+          withoutEnlargement: true,
+          fit: "inside",
+        });
+      }
+
+      // 转换为 webp 格式，在保证高质量（quality: 80）的前提下尽可能压缩体积
+      const compressedBuffer = await pipeline
+        .webp({
+          quality: 80,
+          effort: 4, // 0-6, 4 is a good balance between speed and compression
+        })
+        .toBuffer();
+
+      // 如果压缩后的体积反而变大了（极少数情况），则返回原图
+      if (compressedBuffer.length >= buffer.length) {
+        return { buffer, mimeType };
+      }
+
+      return { buffer: compressedBuffer, mimeType: "image/webp" };
+    } catch (error) {
+      console.error("图片压缩失败:", error);
+      return { buffer, mimeType };
+    }
+  }
+
+  /**
+   * 上传文件到 Supabase Storage
+   * @param data Base64 字符串或 Buffer
+   * @param fileName 文件名
+   * @param mimeType MIME 类型
+   * @param bucket 存储桶名称
+   * @returns 公开访问 URL 和文件元数据
+   */
+  private async uploadToSupabase(
+    data: string | Buffer,
+    fileName: string,
+    mimeType: string,
+    bucket = "mirror",
+  ): Promise<{
+    url: string;
+    size: number;
+    mimeType: string;
+    fileName: string;
+  }> {
+    if (!this.supabase) {
+      throw new BadRequestException("Supabase 未配置，无法上传文件");
+    }
+
+    let buffer = typeof data === "string" ? Buffer.from(data, "base64") : data;
+    let finalMimeType = mimeType;
+    let finalFileName = fileName;
+
+    // 如果是图片且不是 gif/svg，尝试压缩
+    if (
+      mimeType.startsWith("image/") &&
+      mimeType !== "image/gif" &&
+      mimeType !== "image/svg+xml"
+    ) {
+      const compressed = await this.compressImage(buffer, mimeType);
+      buffer = compressed.buffer;
+      finalMimeType = compressed.mimeType;
+
+      // 如果格式转换为 webp，更新文件名后缀
+      if (finalMimeType === "image/webp" && !finalFileName.endsWith(".webp")) {
+        const nameWithoutExt = finalFileName.includes(".")
+          ? finalFileName.substring(0, finalFileName.lastIndexOf("."))
+          : finalFileName;
+        finalFileName = `${nameWithoutExt}.webp`;
+      }
+    }
+
+    const path = `${Date.now()}-${finalFileName}`;
+
+    const { error } = await this.supabase.storage
+      .from(bucket)
+      .upload(path, buffer, {
+        contentType: finalMimeType,
+        upsert: true,
+      });
+
+    if (error) {
+      throw new Error(`文件上传到 Supabase 失败: ${error.message}`);
+    }
+
+    const {
+      data: { publicUrl },
+    } = this.supabase.storage.from(bucket).getPublicUrl(path);
+
+    return {
+      url: publicUrl,
+      size: buffer.length,
+      mimeType: finalMimeType,
+      fileName: finalFileName,
+    };
+  }
+
+  /**
    * 生成聊天标题
    * @param apiKey API Key
    * @param baseURL Base URL
@@ -629,6 +908,10 @@ export class ChatService {
     modelName: string,
     content: string,
   ): Promise<string> {
+    if (content.trim().length <= 30) {
+      return content.trim() || "新对话";
+    }
+
     try {
       const openai = new OpenAI({ apiKey, baseURL });
       const titlePrompt: ChatMessage = {
@@ -703,15 +986,24 @@ export class ChatService {
 
     const buffer = Buffer.from(response.data);
     const contentType = response.headers["content-type"] as string | undefined;
-    const mimeType = contentType || "image/jpeg";
-    const extension = mimeType.split("/")[1] || "jpg";
+    const initialMimeType = contentType || "image/jpeg";
+
+    // 压缩图片
+    const { buffer: compressedBuffer, mimeType } = await this.compressImage(
+      buffer,
+      initialMimeType,
+    );
+
+    let extension = mimeType.split("/")[1] || "jpg";
+    if (extension === "jpeg") extension = "jpg";
+
     const fileName = `${crypto.randomBytes(16).toString("hex")}.${extension}`;
 
     let width: number | undefined;
     let height: number | undefined;
     try {
       const sharpModule = await import("sharp");
-      const metadata = await sharpModule.default(buffer).metadata();
+      const metadata = await sharpModule.default(compressedBuffer).metadata();
       width = metadata.width;
       height = metadata.height;
     } catch {
@@ -727,7 +1019,7 @@ export class ChatService {
 
     const { data, error } = await this.supabase.storage
       .from("mirror")
-      .upload(`${chatId}/${fileName}`, buffer, {
+      .upload(`${chatId}/${fileName}`, compressedBuffer, {
         contentType: mimeType,
         upsert: false,
       });
@@ -743,7 +1035,7 @@ export class ChatService {
     return {
       fileName,
       mimeType,
-      size: buffer.length,
+      size: compressedBuffer.length,
       width,
       height,
       ratio,

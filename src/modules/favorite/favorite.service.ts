@@ -14,10 +14,32 @@ import {
 import * as crypto from "crypto";
 import OpenAI from "openai";
 
+// 存储的图片元数据
+interface StoredImageMetadata {
+  fileName: string;
+  mimeType: string;
+  size: number;
+  width?: number;
+  height?: number;
+  ratio?: string;
+  localPath?: string;
+  url: string;
+  uploadedAt: string;
+}
+
+// 存储的文件元数据
+interface StoredFileMetadata {
+  fileName: string;
+  mimeType: string;
+  size: number;
+  url: string;
+  uploadedAt: string;
+}
+
 // 消息内容片段类型
 interface MessageContentPart {
-  type?: string;
-  data?: string;
+  type: "thinking" | "content" | "image" | "file";
+  data: string | StoredImageMetadata | StoredFileMetadata;
 }
 
 // 聊天消息类型
@@ -47,13 +69,13 @@ interface FavoriteContentWhereInput {
 export class FavoriteService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly configService: ConfigService
+    private readonly configService: ConfigService,
   ) {}
 
   // 生成基于userId和conversation内容的哈希ID
   private generateContentId(
     userId: number,
-    conversation: ChatMessage[]
+    conversation: ChatMessage[],
   ): string {
     const userIdStr = typeof userId === "number" ? userId.toString() : userId;
     const conversationStr =
@@ -77,7 +99,7 @@ export class FavoriteService {
     apiKey: string,
     baseURL: string,
     modelName: string,
-    content: string
+    content: string,
   ): Promise<string> {
     try {
       const openai = new OpenAI({ apiKey, baseURL });
@@ -122,6 +144,10 @@ export class FavoriteService {
       id: _id,
       ...contentData
     } = createFavoriteDto;
+
+    if (!userId || isNaN(userId)) {
+      throw new BadRequestException("无效的用户ID");
+    }
 
     // 1. 检查用户是否存在
     const userExists = await this.prisma.user.findUnique({
@@ -184,7 +210,18 @@ export class FavoriteService {
           contentStr = firstMsg.content;
         } else if (Array.isArray(firstMsg.content)) {
           contentStr = firstMsg.content
-            .map((c: MessageContentPart) => c.data || "")
+            .map((c: MessageContentPart) => {
+              if (typeof c.data === "string") {
+                return c.data;
+              }
+              if (c.type === "image") {
+                return `[图片: ${(c.data as StoredImageMetadata).fileName}]`;
+              }
+              if (c.type === "file") {
+                return `[文件: ${(c.data as StoredFileMetadata).fileName}]`;
+              }
+              return "";
+            })
             .join("");
         } else {
           contentStr = JSON.stringify(firstMsg.content);
@@ -203,7 +240,7 @@ export class FavoriteService {
             apiKey,
             baseURL,
             modelName,
-            contentStr
+            contentStr,
           );
         } else {
           title =
@@ -263,6 +300,14 @@ export class FavoriteService {
   async removeFavorite(removeFavoriteDto: RemoveFavoriteDto) {
     const { userId, contentId } = removeFavoriteDto;
 
+    if (!userId || isNaN(userId)) {
+      throw new BadRequestException("无效的用户ID");
+    }
+
+    if (!contentId) {
+      throw new BadRequestException("无效的内容ID");
+    }
+
     // 检查用户收藏记录是否存在
     const userFavorite = await this.prisma.userFavorite.findUnique({
       where: {
@@ -319,6 +364,10 @@ export class FavoriteService {
     // 确保userId是整数类型
     const userIdNumber =
       typeof userId === "string" ? parseInt(userId, 10) : userId;
+
+    if (!userIdNumber || isNaN(userIdNumber)) {
+      throw new BadRequestException("无效的用户ID");
+    }
 
     // 检查用户是否存在
     const userExists = await this.prisma.user.findUnique({
@@ -404,6 +453,10 @@ export class FavoriteService {
   // 查询单个收藏
   async getFavoriteDetail(getFavoriteDto: GetFavoriteDetailDto) {
     const { contentId } = getFavoriteDto;
+
+    if (!contentId) {
+      throw new BadRequestException("无效的内容ID");
+    }
 
     // 获取收藏内容详情
     const favoriteContent = await this.prisma.favoriteContent.findUnique({
