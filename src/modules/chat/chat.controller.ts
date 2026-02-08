@@ -111,8 +111,13 @@ export class ChatController {
         const fileData: FileData[] = await Promise.all(
           uploadedFiles.files.map(async (file) => {
             let content = "";
+            // 解决文件名乱码问题
+            const originalName = Buffer.from(
+              file.originalname,
+              "latin1",
+            ).toString("utf8");
             const fileExtension =
-              file.originalname.split(".").pop()?.toLowerCase() || "";
+              originalName.split(".").pop()?.toLowerCase() || "";
 
             const isTextFile =
               file.mimetype.startsWith("text/") ||
@@ -120,6 +125,7 @@ export class ChatController {
               ["md", "txt"].includes(fileExtension);
 
             const buffer = file.buffer || readFileSync(file.path);
+            const base64 = buffer.toString("base64");
 
             if (isTextFile) {
               // 文本文件直接读取内容
@@ -150,17 +156,19 @@ export class ChatController {
                     );
                   }
                 }
+                content = extractedText;
               } catch (error) {
-                throw new BadRequestException("Word 文件解析失败：" + error);
+                throw new BadRequestException("Word 解析失败: " + error);
               }
             } else {
-              // 其他二进制文件转 Base64
-              content = buffer.toString("base64");
+              // 其他二进制文件暂不提取内容，只记录文件信息
+              content = `[文件: ${originalName}]`;
             }
 
             return {
-              fileName: file.originalname,
+              fileName: originalName,
               content,
+              base64,
               mimeType: file.mimetype,
               size: file.size,
             };

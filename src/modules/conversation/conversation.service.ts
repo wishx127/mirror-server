@@ -5,13 +5,8 @@ import {
 } from "@nestjs/common";
 import { PrismaService } from "../prisma/prisma.service";
 import { SaveConversationDto } from "./conversation.dto";
+import { StoredMessage } from "../chat/chat.dto";
 import * as crypto from "crypto";
-import { Prisma } from "@prisma/client";
-
-// 对话内容项接口
-interface ConversationContentItem {
-  conversationId?: string;
-}
 
 // 对话列表项类型（导出供 controller 使用）
 export interface ConversationListItem {
@@ -23,7 +18,7 @@ export interface ConversationListItem {
 
 // 带详情的对话列表项类型（导出供 controller 使用）
 export interface ConversationWithDetails extends ConversationListItem {
-  content: Prisma.JsonValue[];
+  content: StoredMessage[];
 }
 
 @Injectable()
@@ -33,7 +28,7 @@ export class ConversationService {
   private generateConversationId(
     userId: number,
     title?: string,
-    content?: string | object
+    content?: string | object,
   ): string {
     const userIdStr = typeof userId === "number" ? userId.toString() : userId;
     const titleStr = typeof title === "string" ? title : "";
@@ -44,7 +39,7 @@ export class ConversationService {
   }
 
   async saveConversation(
-    dto: SaveConversationDto
+    dto: SaveConversationDto,
   ): Promise<{ success: boolean; conversationId: string }> {
     let currentConversationId: string;
 
@@ -88,12 +83,10 @@ export class ConversationService {
       currentConversationId = this.generateConversationId(
         Number(dto.userId),
         dto.title,
-        dtoContent
+        dtoContent,
       );
 
-      const parsedContent = JSON.parse(
-        dtoContent as string
-      ) as ConversationContentItem[];
+      const parsedContent = JSON.parse(dtoContent as string) as StoredMessage[];
       let finalContent: string | object = dtoContent;
       if (Array.isArray(parsedContent) && parsedContent.length > 0) {
         parsedContent[0].conversationId = currentConversationId;
@@ -122,7 +115,7 @@ export class ConversationService {
 
   async getConversations(
     userId: number,
-    includeDetails?: boolean
+    includeDetails?: boolean,
   ): Promise<{
     success: boolean;
     conversations: (ConversationListItem | ConversationWithDetails)[];
@@ -148,7 +141,7 @@ export class ConversationService {
         (conv) =>
           conv.updatedAt &&
           conv.updatedAt >= today &&
-          conv.updatedAt < tomorrow
+          conv.updatedAt < tomorrow,
       )
       .map((conv) => conv.id);
 
@@ -164,13 +157,17 @@ export class ConversationService {
       select: { conversationId: true, content: true },
     });
 
-    // 构建 conversationId -> content[] 的映射
-    const detailsMap = new Map<string, Prisma.JsonValue[]>();
+    // 构建 conversationId -> StoredMessage[] 的映射
+    const detailsMap = new Map<string, StoredMessage[]>();
     allDetails.forEach((detail) => {
       if (!detailsMap.has(detail.conversationId)) {
         detailsMap.set(detail.conversationId, []);
       }
-      detailsMap.get(detail.conversationId)!.push(detail.content);
+      // 将内容展平并添加到映射中
+      const content = detail.content as unknown as StoredMessage[];
+      if (Array.isArray(content)) {
+        detailsMap.get(detail.conversationId)!.push(...content);
+      }
     });
 
     // 为今日更新的对话添加详情
@@ -190,7 +187,7 @@ export class ConversationService {
 
   async deleteConversation(
     userId: number,
-    conversationId: string
+    conversationId: string,
   ): Promise<{ success: boolean }> {
     const conversation = await this.prisma.userConversation.findUnique({
       where: { id: conversationId },
@@ -217,8 +214,8 @@ export class ConversationService {
 
   async getConversationDetails(
     userId: number,
-    conversationId: string
-  ): Promise<{ success: boolean; content: Prisma.JsonValue[] }> {
+    conversationId: string,
+  ): Promise<{ success: boolean; content: StoredMessage[] }> {
     const conversation = await this.prisma.userConversation.findUnique({
       where: { id: conversationId },
     });
@@ -234,6 +231,10 @@ export class ConversationService {
       select: { content: true },
     });
 
-    return { success: true, content: detail.map((d) => d.content) };
+    const flattenedContent = detail.flatMap(
+      (d) => d.content as unknown as StoredMessage[],
+    );
+
+    return { success: true, content: flattenedContent };
   }
 }

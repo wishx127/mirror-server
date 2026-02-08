@@ -8,6 +8,75 @@ import {
 } from "class-validator";
 import { ApiProperty } from "@nestjs/swagger";
 
+// 存储的消息内容片段类型
+export interface StoredMessageContentPart {
+  type: "thinking" | "content";
+  data: string;
+}
+
+// 存储的图片元数据
+export interface StoredImageMetadata {
+  fileName: string;
+  mimeType: string;
+  size: number;
+  width?: number;
+  height?: number;
+  ratio?: string;
+  localPath?: string;
+  url: string;
+  uploadedAt: string;
+}
+
+// 图片内容片段类型
+export interface ImageContentPart {
+  type: "image";
+  data: StoredImageMetadata;
+}
+
+// 存储的文件元数据
+export interface StoredFileMetadata {
+  fileName: string;
+  mimeType: string;
+  size: number;
+  url: string;
+  uploadedAt: string;
+  fileType?: string; // 简化的文件类型
+}
+
+// 文件内容片段类型
+export interface FileContentPart {
+  type: "file";
+  data: StoredFileMetadata;
+}
+
+// 存储的消息格式（支持图片和文件）
+export interface StoredMessage {
+  role: "system" | "user" | "assistant";
+  content:
+    | string
+    | (StoredMessageContentPart | ImageContentPart | FileContentPart)[];
+  key?: string;
+  time?: string;
+  reasoning_content?: string;
+  isFinishThinking?: boolean;
+  conversationId?: string;
+}
+
+// SSE 流式响应数据
+export interface ChatStreamData {
+  content: string;
+  reasoningContent: string;
+  isFinishThinking: boolean;
+  chatId: string | undefined;
+  key: string;
+  time: string;
+}
+
+// SSE 事件结构
+export interface ChatSseEvent {
+  data: ChatStreamData;
+}
+
 // 图像数据接口
 export interface ImageData {
   url?: string; // 图像 URL
@@ -18,7 +87,8 @@ export interface ImageData {
 // 文件数据接口
 export interface FileData {
   fileName: string; // 文件名
-  content: string; // 文件内容（文本）或 Base64（二进制）
+  content: string; // 文件解析后的文本内容
+  base64?: string; // 原始文件的 Base64 编码（可选，用于上传）
   mimeType: string; // 文件 MIME 类型
   size?: number; // 文件大小（字节）
 }

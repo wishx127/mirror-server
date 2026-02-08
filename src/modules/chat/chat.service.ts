@@ -12,79 +12,18 @@ import {
   ChatDto,
   ImageGenerationDto,
   ImageGenerationResponseDto,
+  StoredMessage,
+  StoredMessageContentPart,
+  ImageContentPart,
+  FileContentPart,
+  ChatSseEvent,
+  StoredImageMetadata,
 } from "./chat.dto";
 import OpenAI from "openai";
 import * as crypto from "crypto";
 import { Observable } from "rxjs";
 import axios from "axios";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-
-// 存储的消息内容片段类型
-interface StoredMessageContentPart {
-  type: "thinking" | "content";
-  data: string;
-}
-
-// 存储的图片元数据
-interface StoredImageMetadata {
-  fileName: string;
-  mimeType: string;
-  size: number;
-  width?: number;
-  height?: number;
-  ratio?: string;
-  localPath?: string;
-  url: string;
-  uploadedAt: string;
-}
-
-// 图片内容片段类型
-interface ImageContentPart {
-  type: "image";
-  data: StoredImageMetadata;
-}
-
-// 存储的文件元数据
-interface StoredFileMetadata {
-  fileName: string;
-  mimeType: string;
-  size: number;
-  url: string;
-  uploadedAt: string;
-}
-
-// 文件内容片段类型
-interface FileContentPart {
-  type: "file";
-  data: StoredFileMetadata;
-}
-
-// 存储的消息格式（支持图片和文件）
-interface StoredMessage {
-  role: "system" | "user" | "assistant";
-  content:
-    | string
-    | (StoredMessageContentPart | ImageContentPart | FileContentPart)[];
-  key?: string;
-  time?: string;
-  reasoning_content?: string;
-  isFinishThinking?: boolean;
-}
-
-// SSE 流式响应数据
-interface ChatStreamData {
-  content: string;
-  reasoningContent: string;
-  isFinishThinking: boolean;
-  chatId: string | undefined;
-  key: string;
-  time: string;
-}
-
-// SSE 事件结构
-interface ChatSseEvent {
-  data: ChatStreamData;
-}
 
 // OpenAI 流式响应 delta 类型
 interface StreamDelta {
@@ -554,34 +493,62 @@ export class ChatService {
         filesText += "---";
 
         // 上传文件到 Supabase
-        try {
-          // 如果 content 是 base64 (通常对于二进制文件)，则直接上传
-          // 如果是纯文本，也先转成 base64 上传
-          const isBase64 = /^[A-Za-z0-9+/]*={0,2}$/.test(file.content);
-          const base64Data = isBase64
-            ? file.content
-            : Buffer.from(file.content).toString("base64");
+        // try {
+        //   // 优先使用原始文件的 base64，如果没有则使用解析后的 content
+        //   const base64Data =
+        //     file.base64 ||
+        //     (/^[A-Za-z0-9+/]*={0,2}$/.test(file.content)
+        //       ? file.content
+        //       : Buffer.from(file.content).toString("base64"));
 
-          const uploadResult = await this.uploadToSupabase(
-            base64Data,
-            file.fileName,
-            file.mimeType,
-          );
+        //   const uploadResult = await this.uploadToSupabase(
+        //     base64Data,
+        //     file.fileName,
+        //     file.mimeType,
+        //   );
 
-          // 添加到存储的消息
-          userMessageContent.push({
-            type: "file",
-            data: {
-              fileName: uploadResult.fileName,
-              mimeType: uploadResult.mimeType,
-              size: uploadResult.size,
-              url: uploadResult.url,
-              uploadedAt: this.formatChineseTime(new Date()),
-            },
-          });
-        } catch (error) {
-          console.error(`文件 ${file.fileName} 上传失败:`, error);
-        }
+        //   const fileType =
+        //     uploadResult.fileName.split(".").pop()?.toLowerCase() || "";
+
+        //   // 添加到存储的消息
+        //   userMessageContent.push({
+        //     type: "file",
+        //     data: {
+        //       fileName: uploadResult.fileName,
+        //       mimeType: uploadResult.mimeType,
+        //       size: uploadResult.size,
+        //       url: uploadResult.url,
+        //       uploadedAt: this.formatChineseTime(new Date()),
+        //       fileType,
+        //     },
+        //   });
+        // } catch (error) {
+        //   console.error(`文件 ${file.fileName} 上传失败:`, error);
+        //   const fileType = file.fileName.split(".").pop()?.toLowerCase() || "";
+        //   userMessageContent.push({
+        //     type: "file",
+        //     data: {
+        //       fileName: file.fileName,
+        //       mimeType: file.mimeType,
+        //       size: file.size || 0,
+        //       url: "",
+        //       uploadedAt: this.formatChineseTime(new Date()),
+        //       fileType,
+        //     },
+        //   });
+        // }
+        const fileType = file.fileName.split(".").pop()?.toLowerCase() || "";
+        userMessageContent.push({
+          type: "file",
+          data: {
+            fileName: file.fileName,
+            mimeType: file.mimeType,
+            size: file.size || 0,
+            url: "", // 不存储文件，无下载链接
+            uploadedAt: this.formatChineseTime(new Date()),
+            fileType,
+          },
+        });
       }
       finalContent += filesText;
     }

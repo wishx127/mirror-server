@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 import { IsOptional, IsString, IsNotEmpty, IsNumber } from "class-validator";
 import { Type } from "class-transformer";
+import { StoredMessage } from "../chat/chat.dto";
 
 export class SaveConversationDto {
   @ApiPropertyOptional({ description: "对话ID" })
@@ -15,7 +16,7 @@ export class SaveConversationDto {
 
   @ApiProperty({ description: "对话内容" })
   @IsNotEmpty()
-  content?: any;
+  content?: StoredMessage[] | string;
 
   @ApiProperty({ description: "用户ID" })
   @Type(() => Number)
