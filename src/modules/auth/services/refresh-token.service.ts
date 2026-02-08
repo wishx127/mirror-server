@@ -2,8 +2,9 @@ import {
   Injectable,
   UnauthorizedException,
   Inject,
-  forwardRef,
+  OnModuleInit,
 } from "@nestjs/common";
+import { ModuleRef } from "@nestjs/core";
 import { JwtService } from "@nestjs/jwt";
 import { UserService } from "../../user/user.service";
 import { SessionService } from "./session.service";
@@ -13,15 +14,20 @@ import { JwtPayload } from "../../../config/jwt.strategy";
 const REFRESH_TOKEN_EXPIRES_IN_DAYS = 7;
 
 @Injectable()
-export class RefreshTokenService {
+export class RefreshTokenService implements OnModuleInit {
+  private userService: UserService;
+
   constructor(
     @Inject("REFRESH_JWT_SERVICE")
     private readonly refreshJwtService: JwtService,
-    @Inject(forwardRef(() => UserService))
-    private readonly userService: UserService,
+    private readonly moduleRef: ModuleRef,
     private readonly jwtService: JwtService,
-    private readonly sessionService: SessionService
+    private readonly sessionService: SessionService,
   ) {}
+
+  onModuleInit() {
+    this.userService = this.moduleRef.get(UserService, { strict: false });
+  }
 
   /**
    * 生成refresh token
@@ -52,7 +58,7 @@ export class RefreshTokenService {
    * @returns 新的访问令牌和refresh token
    */
   async refreshAccessToken(
-    refreshToken: string
+    refreshToken: string,
   ): Promise<{ token: string; newRefreshToken: string }> {
     try {
       // 验证refresh token的JWT签名
@@ -88,7 +94,7 @@ export class RefreshTokenService {
       await this.sessionService.updateSession(
         refreshToken,
         newRefreshToken,
-        expiresAt
+        expiresAt,
       );
 
       return {
