@@ -240,9 +240,34 @@ Required variables are defined in `prisma/.env` and project root `.env`. See `op
 
 Global exception filter ensures consistent format across all endpoints.
 
+## Knowledge Base RAG Architecture (Updated)
+
+**VectorStoreService** (`src/modules/knowledge/vectorstore.service.ts`):
+- Uses LangChain `PGVectorStore` for vector operations
+- Manages database connection pool for vector storage
+- Provides `addDocuments()` for batch document insertion with embeddings
+- Provides `similaritySearch()` for vector similarity retrieval with user isolation
+
+**HybridRetriever** (`src/modules/knowledge/retrievers/hybrid.retriever.ts`):
+- Implements LangChain `BaseRetriever` interface
+- Combines vector search + keyword search with RRF fusion
+- Configurable weights (vectorWeight=0.7, keywordWeight=0.3 by default)
+- Parallel execution of both retrieval methods for performance
+
+**RAGChainFactory** (`src/modules/chat/chains/rag-chain.factory.ts`):
+- Creates RAG chains using `RunnableSequence`
+- Formats retrieved documents as context for LLM
+- Supports custom system prompts and chat history
+
+**Key Integration Points**:
+- `KnowledgeService.searchWithRetriever()`: New search method using HybridRetriever
+- `KnowledgeService.createRetriever()`: Creates retriever for RAG chain integration
+- ChatService can optionally use RAG chain for knowledge-enhanced responses
+
 ## Performance Optimizations
 
-- **Batch embedding generation**: Process 10 documents at a time to avoid API rate limits
-- **Parallel retrieval**: Vector and keyword searches run concurrently
+- **Batch embedding generation**: Process documents in batches to avoid API rate limits
+- **Parallel retrieval**: Vector and keyword searches run concurrently in HybridRetriever
+- **Connection pooling**: VectorStoreService manages database connection pool
 - **Role caching**: System roles cached in memory for 24 hours
 - **Database indexing**: Key fields indexed (userId, fileName, conversationId, etc.)
