@@ -1,10 +1,12 @@
-import { Injectable, BadRequestException } from "@nestjs/common";
+import { Injectable, BadRequestException, Inject, forwardRef, Logger } from "@nestjs/common";
 import { Prisma } from "@prisma/client";
 import { PrismaService } from "../prisma/prisma.service";
 import { ConfigService } from "@nestjs/config";
-import { OpenAIEmbeddings } from "@langchain/openai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { Document } from "@langchain/core/documents";
+import { VectorStoreService } from "./vectorstore.service";
+import { HybridRetriever, HybridRetrieverOptions, SearchResult } from "./retrievers/hybrid.retriever";
+import { DocumentLoaderFactory } from "./loaders/document-loader.factory";
 import WordExtractor from "word-extractor";
 import pdf from "pdf-parse";
 import * as mammoth from "mammoth";
@@ -80,7 +82,7 @@ function sanitizeString(str: string): string {
 
 @Injectable()
 export class KnowledgeService {
-  private embeddings: OpenAIEmbeddings;
+  private readonly logger = new Logger(KnowledgeService.name);
   private readonly allowedExtensions = [
     "pdf",
     "docx",
@@ -103,17 +105,29 @@ export class KnowledgeService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly configService: ConfigService
-  ) {
-    const openaiApiKey = this.configService.get<string>("DASHSCOPE_API_KEY");
+    private readonly configService: ConfigService,
+    @Inject(forwardRef(() => VectorStoreService))
+    private readonly vectorStoreService: VectorStoreService
+  ) {}
 
-    this.embeddings = new OpenAIEmbeddings({
-      apiKey: openaiApiKey,
-      configuration: {
-        baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      },
-      modelName: "text-embedding-v1", // 使用通义千问支持的模型
+  /**
+   * 获取用户配置的 API key，如果没有则使用默认的 DASHSCOPE_API_KEY
+   */
+  private async getApiKey(userId: number): Promise<string> {
+    const modelConfig = await this.prisma.modelConfig.findUnique({
+      where: { userId },
     });
+
+    const apiKey =
+      modelConfig?.apiKey ||
+      this.configService.get<string>("DASHSCOPE_API_KEY") ||
+      "";
+
+    if (!apiKey) {
+      throw new BadRequestException("未配置 API Key，请先在设置中配置您的 API Key");
+    }
+
+    return apiKey;
   }
 
   async uploadFile(userId: number, file: Express.Multer.File) {
@@ -131,6 +145,9 @@ export class KnowledgeService {
     if (!this.allowedExtensions.includes(fileExtension)) {
       throw new BadRequestException(`不支持的文件格式 "${fileExtension}"`);
     }
+
+    // 获取用户的 API key
+    const apiKey = await this.getApiKey(userId);
 
     const blob = new Blob([new Uint8Array(file.buffer)]);
     let docs: Document[] = [];
@@ -208,64 +225,23 @@ export class KnowledgeService {
         },
       });
 
-      // 4. 并行生成所有 chunk 的向量
-      const BATCH_SIZE = 10; // 每批并行处理的数量，避免 API 限流
-      const allEmbeddings: number[][] = [];
-
-      for (let i = 0; i < splitDocs.length; i += BATCH_SIZE) {
-        const batch = splitDocs.slice(i, i + BATCH_SIZE);
-        const batchEmbeddings = await Promise.all(
-          batch.map((doc) => this.embeddings.embedQuery(doc.pageContent))
-        );
-        allEmbeddings.push(...batchEmbeddings);
-      }
-
-      // 5. 使用事务批量插入数据库
-      // 设置较长的超时时间（根据 chunks 数量动态调整）
-      const timeoutMs = Math.max(30000, splitDocs.length * 500); // 每个 chunk 至少 500ms，最少 30 秒
-
-      // 确保 file.buffer 是 Buffer 类型
+      // 4. 使用 VectorStoreService 添加文档（包含批量插入优化）
       const fileBuffer = Buffer.isBuffer(file.buffer)
         ? file.buffer
         : Buffer.from(file.buffer);
 
-      await this.prisma.$transaction(
-        async (tx) => {
-          // 首先插入第一个 chunk（包含源文件数据）
-          const firstEmbeddingString = `[${allEmbeddings[0].join(",")}]`;
-          const firstSanitizedContent = sanitizeString(
-            splitDocs[0].pageContent
-          );
-
-          // 使用 $queryRawUnsafe 并用 $1, $2 等占位符，确保 bytea 正确传递
-          await tx.$executeRawUnsafe(
-            `INSERT INTO "Knowledge" ("userId", "fileName", "content", "preview", "size", "type", "fileData", "embedding", "updatedAt")
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, NOW())`,
-            userId,
-            originalname,
-            firstSanitizedContent,
-            preview,
-            file.size,
-            displayType,
-            fileBuffer,
-            firstEmbeddingString
-          );
-
-          // 其余 chunks 逐个插入（不包含源文件数据）
-          for (let i = 1; i < splitDocs.length; i++) {
-            const embeddingString = `[${allEmbeddings[i].join(",")}]`;
-            const sanitizedContent = sanitizeString(splitDocs[i].pageContent);
-
-            await tx.$executeRaw`
-              INSERT INTO "Knowledge" ("userId", "fileName", "content", "preview", "size", "type", "embedding", "updatedAt")
-              VALUES (${userId}, ${originalname}, ${sanitizedContent}, ${preview}, ${file.size}, ${displayType}, ${embeddingString}::vector, NOW())
-            `;
-          }
-        },
+      await this.vectorStoreService.addDocuments(
+        splitDocs,
         {
-          maxWait: 60000, // 最大等待获取连接时间 60 秒
-          timeout: timeoutMs, // 事务超时时间根据 chunks 数量动态调整
-        }
+          userId,
+          fileName: originalname,
+          fileSize: file.size,
+          fileType: displayType,
+          preview,
+          fileData: fileBuffer,
+          isFirstChunk: true,
+        },
+        apiKey
       );
 
       return {
@@ -273,6 +249,117 @@ export class KnowledgeService {
         fileName: originalname,
         type: displayType,
         chunks: splitDocs.length,
+      };
+    } catch (error) {
+      throw new BadRequestException(
+        `处理文件失败: ${getErrorMessage(error as Error | string)}`
+      );
+    }
+  }
+
+  /**
+   * 使用 DocumentLoaderFactory 上传文件
+   * 使用 LangChain Document Loaders 替代手动文件解析
+   */
+  async uploadFileWithLoader(userId: number, file: Express.Multer.File) {
+    if (!file) {
+      throw new BadRequestException("未上传文件");
+    }
+
+    const originalname = sanitizeString(
+      file.originalname
+        ? Buffer.from(file.originalname, "latin1").toString("utf8")
+        : ""
+    );
+    const fileExtension = originalname.split(".").pop()?.toLowerCase() || "";
+
+    if (!this.allowedExtensions.includes(fileExtension)) {
+      throw new BadRequestException(`不支持的文件格式 "${fileExtension}"`);
+    }
+
+    // 获取用户的 API key
+    const apiKey = await this.getApiKey(userId);
+
+    try {
+      const fileBuffer = Buffer.isBuffer(file.buffer)
+        ? file.buffer
+        : Buffer.from(file.buffer);
+
+      // 1. 使用 DocumentLoaderFactory 加载文档
+      const loaderResult = await DocumentLoaderFactory.loadDocument(
+        fileBuffer,
+        originalname,
+        fileExtension
+      );
+
+      if (
+        !loaderResult.documents.length ||
+        !loaderResult.documents[0].pageContent.trim()
+      ) {
+        throw new BadRequestException("文件内容为空");
+      }
+
+      // 附加元数据
+      const docs = DocumentLoaderFactory.attachMetadata(loaderResult.documents, {
+        fileName: originalname,
+        fileSize: file.size,
+        fileType: fileExtension,
+        uploadTime: new Date(),
+      });
+
+      // 生成预览内容
+      const fullText = docs.map((d) => d.pageContent).join("\n");
+      const preview = sanitizeString(
+        fileExtension === "md"
+          ? fullText.slice(0, 200)
+          : fullText.replace(/[ \t]+/g, "").slice(0, 200)
+      );
+
+      const displayType = this.getDisplayType(fileExtension, file.mimetype);
+
+      // 2. 使用 LangChain 进行文本切片
+      const splitter = new RecursiveCharacterTextSplitter({
+        chunkSize: 1000,
+        chunkOverlap: 150,
+        separators: ["\n\n", "\n", "。", "！", "？", ".", "!", "?", " "],
+      });
+
+      const splitDocs = await splitter.splitDocuments(docs);
+
+      // 3. 删除旧的同名文件记录
+      await this.prisma.knowledge.deleteMany({
+        where: {
+          userId,
+          fileName: originalname,
+        },
+      });
+
+      // 4. 使用 VectorStoreService 添加文档
+      await this.vectorStoreService.addDocuments(
+        splitDocs,
+        {
+          userId,
+          fileName: originalname,
+          fileSize: file.size,
+          fileType: displayType,
+          preview,
+          fileData: fileBuffer,
+          isFirstChunk: true,
+        },
+        apiKey
+      );
+
+      this.logger.log(
+        `File uploaded with DocumentLoader: ${originalname}, ${splitDocs.length} chunks`
+      );
+
+      return {
+        success: true,
+        fileName: originalname,
+        type: displayType,
+        chunks: splitDocs.length,
+        pageCount: loaderResult.pageCount,
+        wordCount: loaderResult.wordCount,
       };
     } catch (error) {
       throw new BadRequestException(
@@ -302,9 +389,12 @@ export class KnowledgeService {
     minSimilarity: number = 0.3
   ) {
     try {
+      // 获取用户的 API key
+      const apiKey = await this.getApiKey(userId);
+
       // 并行执行向量检索和关键词检索
       const [vectorResults, keywordResults] = await Promise.all([
-        this.vectorSearch(userId, query, limit * 2, minSimilarity),
+        this.vectorSearch(userId, query, limit * 2, minSimilarity, apiKey),
         this.keywordSearch(userId, query, limit * 2),
       ]);
 
@@ -333,28 +423,115 @@ export class KnowledgeService {
   }
 
   /**
+   * 使用 HybridRetriever 进行混合检索
+   * 这是新的推荐搜索方法，使用 LangChain Retriever 接口
+   */
+  async searchWithRetriever(
+    userId: number,
+    query: string,
+    options: HybridRetrieverOptions = {}
+  ): Promise<{ success: boolean; results: SearchResult[] }> {
+    try {
+      // 获取用户的 API key
+      const apiKey = await this.getApiKey(userId);
+
+      const pool = this.vectorStoreService.getPool() as import("pg").Pool;
+      if (!pool) {
+        throw new Error("Database pool not initialized");
+      }
+
+      const retriever = new HybridRetriever(
+        pool,
+        this.vectorStoreService.getEmbeddings(apiKey),
+        userId,
+        {
+          limit: options.limit ?? 5,
+          minSimilarity: options.minSimilarity ?? 0.3,
+          rrfK: options.rrfK ?? 60,
+          vectorWeight: options.vectorWeight ?? 0.7,
+          keywordWeight: options.keywordWeight ?? 0.3,
+        }
+      );
+
+      const results = await retriever.getSearchResults(query);
+
+      this.logger.log(
+        `HybridRetriever search completed, returned ${results.length} results`
+      );
+
+      return { success: true, results };
+    } catch (error) {
+      throw new BadRequestException(
+        `搜索失败: ${getErrorMessage(error as Error | string)}`
+      );
+    }
+  }
+
+  /**
+   * 创建 HybridRetriever 实例
+   * 用于集成到 RAG Chain
+   */
+  async createRetriever(
+    userId: number,
+    options: HybridRetrieverOptions = {}
+  ): Promise<HybridRetriever> {
+    // 获取用户的 API key
+    const apiKey = await this.getApiKey(userId);
+
+    const pool = this.vectorStoreService.getPool() as import("pg").Pool;
+    if (!pool) {
+      throw new Error("Database pool not initialized");
+    }
+
+    return new HybridRetriever(
+      pool,
+      this.vectorStoreService.getEmbeddings(apiKey),
+      userId,
+      options
+    );
+  }
+
+  /**
    * 向量检索
    */
   private async vectorSearch(
     userId: number,
     query: string,
     limit: number,
-    minSimilarity: number
+    minSimilarity: number,
+    apiKey: string
   ): Promise<VectorSearchResult[]> {
-    const queryEmbedding = await this.embeddings.embedQuery(query);
-    const queryEmbeddingString = `[${queryEmbedding.join(",")}]`;
+    // 使用 VectorStoreService 进行向量检索
+    const results = await this.vectorStoreService.similaritySearch(
+      query,
+      userId,
+      limit,
+      minSimilarity,
+      apiKey
+    );
 
-    const results: VectorSearchResult[] = await this.prisma.$queryRaw`
-      SELECT id, "fileName", content, preview, size, type, 
-             1 - (embedding <=> ${queryEmbeddingString}::vector) as similarity
-      FROM "Knowledge"
-      WHERE "userId" = ${userId} 
-      AND 1 - (embedding <=> ${queryEmbeddingString}::vector) >= ${minSimilarity}
-      ORDER BY embedding <=> ${queryEmbeddingString}::vector
-      LIMIT ${limit}
-    `;
+    // 转换为 VectorSearchResult 格式
+    // 需要从数据库获取额外的字段（fileName, preview, size, type）
+    const ids = results.map((r) => r.id);
+    const records = await this.prisma.knowledge.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, fileName: true, preview: true, size: true, type: true },
+    });
 
-    return results;
+    const recordMap = new Map(records.map((r) => [r.id, r]));
+
+    return results.map((r) => {
+      const record = recordMap.get(r.id);
+      return {
+        id: r.id,
+        fileName: record?.fileName || "",
+        content: r.content,
+        preview: record?.preview || "",
+        size: record?.size || 0,
+        type: record?.type || "",
+        similarity: r.similarity,
+      };
+    });
   }
 
   /**

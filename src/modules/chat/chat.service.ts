@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   UnauthorizedException,
+  Logger,
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { PrismaService } from "../prisma/prisma.service";
@@ -21,9 +22,12 @@ import {
 } from "./chat.dto";
 import OpenAI from "openai";
 import * as crypto from "crypto";
-import { Observable } from "rxjs";
+import { Observable, Subscriber } from "rxjs";
 import axios from "axios";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
+import { RAGChainFactory } from "./chains/rag-chain.factory";
 
 // OpenAI 流式响应 delta 类型
 interface StreamDelta {
@@ -86,6 +90,7 @@ interface AliyunImageResponse {
 @Injectable()
 export class ChatService {
   private supabase: SupabaseClient | null;
+  private readonly logger = new Logger(ChatService.name);
 
   constructor(
     private readonly prisma: PrismaService,
@@ -101,6 +106,42 @@ export class ChatService {
     } else {
       this.supabase = null;
     }
+  }
+
+  /**
+   * 创建 ChatOpenAI 实例
+   */
+  private createChatOpenAI(apiKey: string, baseURL: string, modelName: string): ChatOpenAI {
+    // 临时设置环境变量，确保 LangChain 在任何地方都能获取到 apiKey
+    // 这是解决 stream 模式下 apiKey 丢失问题的最可靠方法
+    process.env.OPENAI_API_KEY = apiKey;
+    if (baseURL) {
+      process.env.OPENAI_BASE_URL = baseURL;
+    }
+    
+    return new ChatOpenAI({
+      openAIApiKey: apiKey,
+      model: modelName,
+      streaming: true,
+      temperature: 0.7,
+    });
+  }
+
+  /**
+   * 将存储的消息转换为 LangChain BaseMessage 格式
+   */
+  private convertToBaseMessages(messages: ChatMessage[]): BaseMessage[] {
+    return messages
+      .filter((msg) => msg.role !== "system") // 系统消息在 RAG Chain 中单独处理
+      .map((msg) => {
+        const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+        if (msg.role === "user") {
+          return new HumanMessage(content);
+        } else if (msg.role === "assistant") {
+          return new AIMessage(content);
+        }
+        return new HumanMessage(content);
+      });
   }
 
   private calculateAspectRatio(width: number, height: number): string {
@@ -130,6 +171,165 @@ export class ChatService {
     }
 
     return closestRatio;
+  }
+
+  /**
+   * 使用 RAG Chain 进行流式对话
+   * 将 LangChain 流式响应转换为 RxJS Observable
+   * @returns Observable 和一个用于存储完整回复的引用
+   */
+  private async streamRAGChain(
+    userId: number,
+    query: string,
+    chatHistory: BaseMessage[],
+    systemPrompt: string,
+    apiKey: string,
+    baseURL: string,
+    modelName: string,
+    options: {
+      topK?: number;
+      minSimilarity?: number;
+    } = {},
+  ): Promise<{
+    observable: Observable<ChatSseEvent>;
+    fullReplyRef: { value: string };
+    assistantKey: string;
+    assistantTime: string;
+  }> {
+    const { topK = 5, minSimilarity = 0.2 } = options;
+    const assistantKey = this.getRandomKey();
+    const assistantTime = this.formatChineseTime(new Date());
+    const fullReplyRef = { value: "" };
+
+    // 1. 创建 HybridRetriever
+    const retriever = await this.knowledgeService.createRetriever(userId, {
+      limit: topK,
+      minSimilarity,
+    });
+
+    this.logger.log(`Creating ChatOpenAI with apiKey: ${apiKey ? 'provided' : 'MISSING'}, baseURL: ${baseURL || 'MISSING'}, model: ${modelName}`);
+
+    // 2. 创建 ChatOpenAI 实例
+    const llm = this.createChatOpenAI(apiKey, baseURL, modelName);
+
+    // 3. 创建 RAG Chain
+    const ragChain = RAGChainFactory.createCustomRAGChain(
+      llm,
+      retriever,
+      systemPrompt,
+    );
+
+    this.logger.log(`RAG Chain created successfully for user ${userId}`);
+
+    // 4. 执行流式调用并转换为 Observable
+    const observable = new Observable((subscriber: Subscriber<ChatSseEvent>) => {
+      void (async () => {
+        try {
+          const stream = await ragChain.stream({
+            input: query,
+            chat_history: chatHistory,
+          });
+
+          for await (const chunk of stream) {
+            // chunk 是字符串片段
+            if (chunk) {
+              fullReplyRef.value += chunk;
+              subscriber.next({
+                data: {
+                  content: chunk,
+                  reasoningContent: "",
+                  isFinishThinking: true,
+                  chatId: undefined,
+                  key: assistantKey,
+                  time: assistantTime,
+                },
+              });
+            }
+          }
+
+          subscriber.complete();
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : "未知错误";
+          this.logger.error(`RAG Chain stream error: ${message}`);
+          subscriber.error(
+            new BadRequestException(`RAG Chain 流式调用失败: ${message}`),
+          );
+        }
+      })();
+    });
+
+    return { observable, fullReplyRef, assistantKey, assistantTime };
+  }
+
+  /**
+   * 保存对话到数据库
+   * 统一的消息存储逻辑，供 RAG Chain 和 OpenAI SDK 流程共用
+   */
+  private async saveConversation(
+    userId: number,
+    chatId: string,
+    isNewConversation: boolean,
+    newMessages: StoredMessage[],
+    apiKey: string,
+    baseURL: string,
+    modelName: string,
+    userContent: string,
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      // 如果是新对话，先创建对话记录并生成标题
+      if (isNewConversation) {
+        const title = await this.generateConversationTitle(
+          apiKey,
+          baseURL,
+          modelName,
+          userContent,
+        );
+        await tx.userConversation.create({
+          data: {
+            id: chatId,
+            userId: userId,
+            title: title,
+          },
+        });
+      }
+
+      // 获取已有的对话详情
+      const existingDetail = await tx.conversationDetail.findFirst({
+        where: { conversationId: chatId },
+      });
+
+      if (existingDetail) {
+        const currentContent = Array.isArray(existingDetail.content)
+          ? (existingDetail.content as unknown as StoredMessage[])
+          : [existingDetail.content as unknown as StoredMessage];
+
+        await tx.conversationDetail.update({
+          where: { id: existingDetail.id },
+          data: {
+            content: [
+              ...currentContent,
+              ...newMessages,
+            ] as unknown as object[],
+          },
+        });
+      } else {
+        // 如果不存在，则创建新记录
+        await tx.conversationDetail.create({
+          data: {
+            conversationId: chatId,
+            content: newMessages as unknown as object[],
+          },
+        });
+      }
+
+      // 更新对话最后活跃时间
+      if (!isNewConversation) {
+        await tx.userConversation.update({
+          where: { id: chatId },
+          data: { updatedAt: new Date() },
+        });
+      }
+    });
   }
 
   async chatStream(
@@ -315,33 +515,35 @@ export class ChatService {
       systemContent = await this.roleService.getUserSystemPrompt(userId);
     }
 
-    // 3. 知识库检索
-    if (dto.enableKnowledge && userId) {
-      const searchResult = await this.knowledgeService.search(
-        userId,
-        dto.content,
-        dto.topK ?? 5,
-        dto.minSimilarity ?? 0.2,
-      );
-      if (searchResult.success && searchResult.results.length > 0) {
-        const knowledgeContext = `
-          ## 参考资料（按相关性排序）
-          ${searchResult.results
-            .map(
-              (res, i) => `
-            ### 资料 ${i + 1} [相似度: ${(res.similarity * 100).toFixed(1)}%]
-              - 来源: ${res.fileName}
-              - 内容: ${res.content}
-            `,
-            )
-            .join("\n\n")}
-          ## 回答要求
-            1. 优先使用上述参考资料回答
-            2. 若资料不足，可结合自身知识补充
-        `;
-        systemContent += `\n\n以下是与用户问题相关的参考资料，请优先根据这些内容进行回答，若资料不足以回答问题，请根据自己的知识进行回答：\n\n${knowledgeContext}`;
-      }
-    }
+    // 3. 判断是否使用 RAG Chain（启用知识库且有用户ID）
+    const useRAGChain = dto.enableKnowledge && userId && !dto.images?.length && !dto.files?.length;
+
+    // if (!useRAGChain && dto.enableKnowledge && userId) {
+    //   const searchResult = await this.knowledgeService.search(
+    //     userId,
+    //     dto.content,
+    //     dto.topK ?? 5,
+    //     dto.minSimilarity ?? 0.2,
+    //   );
+    //   if (searchResult.success && searchResult.results.length > 0) {
+    //     const knowledgeContext = `
+    //       ## 参考资料（按相关性排序）
+    //       ${searchResult.results
+    //         .map(
+    //           (res, i) => `
+    //         ### 资料 ${i + 1} [相似度: ${(res.similarity * 100).toFixed(1)}%]
+    //           - 来源: ${res.fileName}
+    //           - 内容: ${res.content}
+    //         `,
+    //         )
+    //         .join("\n\n")}
+    //       ## 回答要求
+    //         1. 优先使用上述参考资料回答
+    //         2. 若资料不足，可结合自身知识补充
+    //     `;
+    //     systemContent += `\n\n以下是与用户问题相关的参考资料，请优先根据这些内容进行回答，若资料不足以回答问题，请根据自己的知识进行回答：\n\n${knowledgeContext}`;
+    //   }
+    // }
 
     messages.unshift({
       role: "system",
@@ -579,6 +781,86 @@ export class ChatService {
           : userContentParts,
     });
 
+    // 4. 如果启用知识库且无图片/文件，使用 RAG Chain 进行流式处理
+    if (useRAGChain) {
+      this.logger.log(`Using RAG Chain for user ${userId}`);
+
+      // 将历史消息转换为 LangChain BaseMessage 格式
+      const chatHistory = this.convertToBaseMessages(messages);
+
+      // 调用 RAG Chain 流式处理
+      const ragResult = await this.streamRAGChain(
+        userId,
+        dto.content,
+        chatHistory,
+        systemContent,
+        apiKey,
+        baseURL,
+        modelName,
+        {
+          topK: dto.topK ?? 5,
+          minSimilarity: dto.minSimilarity ?? 0.2,
+        },
+      );
+
+      // 包装 Observable 以添加消息存储逻辑
+      return new Observable((subscriber) => {
+        void (() => {
+          let fullReply = "";
+
+          ragResult.observable.subscribe({
+            next: (event) => {
+              fullReply += event.data.content;
+              // 更新 chatId
+              event.data.chatId = chatId || undefined;
+              subscriber.next(event);
+            },
+            complete: async () => {
+              // 保存消息到数据库
+              if (userId && chatId) {
+                const assistantContent: StoredMessageContentPart[] = [];
+                if (fullReply) {
+                  assistantContent.push({ type: "content", data: fullReply });
+                }
+
+                const newMessages: StoredMessage[] = [
+                  {
+                    role: "user",
+                    content: userMessage.content,
+                    key: userMessage.key,
+                    time: userMessage.time,
+                  },
+                  {
+                    role: "assistant",
+                    content: assistantContent,
+                    key: ragResult.assistantKey,
+                    time: ragResult.assistantTime,
+                    isFinishThinking: true,
+                  },
+                ];
+
+                await this.saveConversation(
+                  userId,
+                  chatId,
+                  isNewConversation,
+                  newMessages,
+                  apiKey,
+                  baseURL,
+                  modelName,
+                  dto.content,
+                );
+              }
+              subscriber.complete();
+            },
+            error: (error) => {
+              subscriber.error(error);
+            },
+          });
+        })();
+      });
+    }
+
+    // 5. 常规流程：使用 OpenAI SDK 进行流式处理
     const openai = new OpenAI({
       apiKey: apiKey,
       baseURL: baseURL,
@@ -641,7 +923,8 @@ export class ChatService {
             });
           }
 
-          // 5. 只有已登录用户才保存对话详情
+
+          // 6. 只有已登录用户才保存对话详情
           if (userId && chatId) {
             const assistantContent: StoredMessageContentPart[] = [];
             if (fullReasoning) {
@@ -667,62 +950,16 @@ export class ChatService {
               },
             ];
 
-            // 优化：使用事务批量处理所有数据库写入操作，减少阻塞
-            await this.prisma.$transaction(async (tx) => {
-              // 如果是新对话，先创建对话记录并生成标题
-              if (isNewConversation) {
-                const title = await this.generateConversationTitle(
-                  apiKey,
-                  baseURL,
-                  modelName,
-                  dto.content,
-                );
-                await tx.userConversation.create({
-                  data: {
-                    id: chatId,
-                    userId: userId,
-                    title: title,
-                  },
-                });
-              }
-
-              // 获取已有的对话详情
-              const existingDetail = await tx.conversationDetail.findFirst({
-                where: { conversationId: chatId },
-              });
-
-              if (existingDetail) {
-                const currentContent = Array.isArray(existingDetail.content)
-                  ? (existingDetail.content as unknown as StoredMessage[])
-                  : [existingDetail.content as unknown as StoredMessage];
-
-                await tx.conversationDetail.update({
-                  where: { id: existingDetail.id },
-                  data: {
-                    content: [
-                      ...currentContent,
-                      ...newMessages,
-                    ] as unknown as object[],
-                  },
-                });
-              } else {
-                // 如果不存在，则创建新记录
-                await tx.conversationDetail.create({
-                  data: {
-                    conversationId: chatId,
-                    content: newMessages as unknown as object[],
-                  },
-                });
-              }
-
-              // 更新对话最后活跃时间
-              if (!isNewConversation) {
-                await tx.userConversation.update({
-                  where: { id: chatId },
-                  data: { updatedAt: new Date() },
-                });
-              }
-            });
+            await this.saveConversation(
+              userId,
+              chatId,
+              isNewConversation,
+              newMessages,
+              apiKey,
+              baseURL,
+              modelName,
+              dto.content,
+            );
           }
 
           subscriber.complete();

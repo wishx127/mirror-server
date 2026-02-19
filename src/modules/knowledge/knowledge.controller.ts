@@ -71,7 +71,7 @@ export class KnowledgeController {
         `文件大小超过限制，最大允许 ${MAX_FILE_SIZE / 1024 / 1024}MB，当前文件大小 ${file.size / 1024 / 1024}MB`
       );
     }
-    return this.knowledgeService.uploadFile(Number(dto.userId), file);
+    return this.knowledgeService.uploadFileWithLoader(Number(dto.userId), file);
   }
 
   @Post("search")
