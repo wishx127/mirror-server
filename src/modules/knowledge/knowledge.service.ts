@@ -2,7 +2,6 @@ import { Injectable, BadRequestException, Inject, forwardRef, Logger } from "@ne
 import { Prisma } from "@prisma/client";
 import { PrismaService } from "../prisma/prisma.service";
 import { ConfigService } from "@nestjs/config";
-import { OpenAIEmbeddings } from "@langchain/openai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { Document } from "@langchain/core/documents";
 import { VectorStoreService } from "./vectorstore.service";
@@ -84,7 +83,6 @@ function sanitizeString(str: string): string {
 @Injectable()
 export class KnowledgeService {
   private readonly logger = new Logger(KnowledgeService.name);
-  private embeddings: OpenAIEmbeddings;
   private readonly allowedExtensions = [
     "pdf",
     "docx",
@@ -110,16 +108,26 @@ export class KnowledgeService {
     private readonly configService: ConfigService,
     @Inject(forwardRef(() => VectorStoreService))
     private readonly vectorStoreService: VectorStoreService
-  ) {
-    const openaiApiKey = this.configService.get<string>("DASHSCOPE_API_KEY");
+  ) {}
 
-    this.embeddings = new OpenAIEmbeddings({
-      apiKey: openaiApiKey,
-      configuration: {
-        baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      },
-      modelName: "text-embedding-v1", // 使用通义千问支持的模型
+  /**
+   * 获取用户配置的 API key，如果没有则使用默认的 DASHSCOPE_API_KEY
+   */
+  private async getApiKey(userId: number): Promise<string> {
+    const modelConfig = await this.prisma.modelConfig.findUnique({
+      where: { userId },
     });
+
+    const apiKey =
+      modelConfig?.apiKey ||
+      this.configService.get<string>("DASHSCOPE_API_KEY") ||
+      "";
+
+    if (!apiKey) {
+      throw new BadRequestException("未配置 API Key，请先在设置中配置您的 API Key");
+    }
+
+    return apiKey;
   }
 
   async uploadFile(userId: number, file: Express.Multer.File) {
@@ -137,6 +145,9 @@ export class KnowledgeService {
     if (!this.allowedExtensions.includes(fileExtension)) {
       throw new BadRequestException(`不支持的文件格式 "${fileExtension}"`);
     }
+
+    // 获取用户的 API key
+    const apiKey = await this.getApiKey(userId);
 
     const blob = new Blob([new Uint8Array(file.buffer)]);
     let docs: Document[] = [];
@@ -219,15 +230,19 @@ export class KnowledgeService {
         ? file.buffer
         : Buffer.from(file.buffer);
 
-      await this.vectorStoreService.addDocuments(splitDocs, {
-        userId,
-        fileName: originalname,
-        fileSize: file.size,
-        fileType: displayType,
-        preview,
-        fileData: fileBuffer,
-        isFirstChunk: true,
-      });
+      await this.vectorStoreService.addDocuments(
+        splitDocs,
+        {
+          userId,
+          fileName: originalname,
+          fileSize: file.size,
+          fileType: displayType,
+          preview,
+          fileData: fileBuffer,
+          isFirstChunk: true,
+        },
+        apiKey
+      );
 
       return {
         success: true,
@@ -261,6 +276,9 @@ export class KnowledgeService {
     if (!this.allowedExtensions.includes(fileExtension)) {
       throw new BadRequestException(`不支持的文件格式 "${fileExtension}"`);
     }
+
+    // 获取用户的 API key
+    const apiKey = await this.getApiKey(userId);
 
     try {
       const fileBuffer = Buffer.isBuffer(file.buffer)
@@ -317,15 +335,19 @@ export class KnowledgeService {
       });
 
       // 4. 使用 VectorStoreService 添加文档
-      await this.vectorStoreService.addDocuments(splitDocs, {
-        userId,
-        fileName: originalname,
-        fileSize: file.size,
-        fileType: displayType,
-        preview,
-        fileData: fileBuffer,
-        isFirstChunk: true,
-      });
+      await this.vectorStoreService.addDocuments(
+        splitDocs,
+        {
+          userId,
+          fileName: originalname,
+          fileSize: file.size,
+          fileType: displayType,
+          preview,
+          fileData: fileBuffer,
+          isFirstChunk: true,
+        },
+        apiKey
+      );
 
       this.logger.log(
         `File uploaded with DocumentLoader: ${originalname}, ${splitDocs.length} chunks`
@@ -367,9 +389,12 @@ export class KnowledgeService {
     minSimilarity: number = 0.3
   ) {
     try {
+      // 获取用户的 API key
+      const apiKey = await this.getApiKey(userId);
+
       // 并行执行向量检索和关键词检索
       const [vectorResults, keywordResults] = await Promise.all([
-        this.vectorSearch(userId, query, limit * 2, minSimilarity),
+        this.vectorSearch(userId, query, limit * 2, minSimilarity, apiKey),
         this.keywordSearch(userId, query, limit * 2),
       ]);
 
@@ -407,6 +432,9 @@ export class KnowledgeService {
     options: HybridRetrieverOptions = {}
   ): Promise<{ success: boolean; results: SearchResult[] }> {
     try {
+      // 获取用户的 API key
+      const apiKey = await this.getApiKey(userId);
+
       const pool = this.vectorStoreService.getPool() as import("pg").Pool;
       if (!pool) {
         throw new Error("Database pool not initialized");
@@ -414,7 +442,7 @@ export class KnowledgeService {
 
       const retriever = new HybridRetriever(
         pool,
-        this.vectorStoreService.getEmbeddings(),
+        this.vectorStoreService.getEmbeddings(apiKey),
         userId,
         {
           limit: options.limit ?? 5,
@@ -443,10 +471,13 @@ export class KnowledgeService {
    * 创建 HybridRetriever 实例
    * 用于集成到 RAG Chain
    */
-  createRetriever(
+  async createRetriever(
     userId: number,
     options: HybridRetrieverOptions = {}
-  ): HybridRetriever {
+  ): Promise<HybridRetriever> {
+    // 获取用户的 API key
+    const apiKey = await this.getApiKey(userId);
+
     const pool = this.vectorStoreService.getPool() as import("pg").Pool;
     if (!pool) {
       throw new Error("Database pool not initialized");
@@ -454,7 +485,7 @@ export class KnowledgeService {
 
     return new HybridRetriever(
       pool,
-      this.vectorStoreService.getEmbeddings(),
+      this.vectorStoreService.getEmbeddings(apiKey),
       userId,
       options
     );
@@ -467,14 +498,16 @@ export class KnowledgeService {
     userId: number,
     query: string,
     limit: number,
-    minSimilarity: number
+    minSimilarity: number,
+    apiKey: string
   ): Promise<VectorSearchResult[]> {
     // 使用 VectorStoreService 进行向量检索
     const results = await this.vectorStoreService.similaritySearch(
       query,
       userId,
       limit,
-      minSimilarity
+      minSimilarity,
+      apiKey
     );
 
     // 转换为 VectorSearchResult 格式

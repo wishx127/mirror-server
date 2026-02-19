@@ -80,7 +80,7 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
   private vectorStore: PGVectorStore | null = null;
   private pool: SafePool | null = null;
   private rawPool: unknown = null;
-  private embeddings: OpenAIEmbeddings;
+  private defaultEmbeddings: OpenAIEmbeddings;
 
   private readonly config: VectorStoreConfig = {
     tableName: "Knowledge",
@@ -90,11 +90,31 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
   };
 
   constructor(private readonly configService: ConfigService) {
-    // 使用与 KnowledgeService 相同的 embedding 配置（通义千问）
+    // 创建默认的 embeddings 实例（使用 DASHSCOPE_API_KEY 作为后备）
     const openaiApiKey = this.configService.get<string>("DASHSCOPE_API_KEY");
 
-    this.embeddings = new OpenAIEmbeddings({
+    this.defaultEmbeddings = new OpenAIEmbeddings({
       apiKey: openaiApiKey,
+      configuration: {
+        baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      },
+      modelName: "text-embedding-v1",
+    });
+  }
+
+  /**
+   * 创建 OpenAI Embeddings 实例
+   * @param apiKey 可选的 API key，如果不提供则使用默认的 DASHSCOPE_API_KEY
+   */
+  createEmbeddings(apiKey?: string): OpenAIEmbeddings {
+    const key = apiKey || this.configService.get<string>("DASHSCOPE_API_KEY");
+
+    if (!key) {
+      throw new Error("未配置 API Key");
+    }
+
+    return new OpenAIEmbeddings({
+      apiKey: key,
       configuration: {
         baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
       },
@@ -166,7 +186,7 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
 
     // 初始化 PGVectorStore
     // 注意：我们使用现有的 Knowledge 表，不使用 PGVectorStore 的默认表创建逻辑
-    this.vectorStore = await PGVectorStore.initialize(this.embeddings, {
+    this.vectorStore = await PGVectorStore.initialize(this.defaultEmbeddings, {
       pool: rawPool as PgPool,
       tableName: this.config.tableName,
       columns: {
@@ -196,7 +216,8 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
    */
   async addDocuments(
     documents: Document[],
-    options: AddDocumentsOptions
+    options: AddDocumentsOptions,
+    apiKey?: string
   ): Promise<void> {
     await this.ensureInitialized();
 
@@ -220,8 +241,11 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
     // 注意：PGVectorStore 需要 metadata 列，我们需要使用自定义插入
     // 由于我们的表结构没有 metadata 字段，我们使用直接的 SQL 插入
     
-    // 获取 embedding 向量
-    const embeddings = await this.embeddings.embedDocuments(
+    // 获取 embedding 向量（使用传入的 API key 或默认的）
+    const embeddings = apiKey
+      ? this.createEmbeddings(apiKey)
+      : this.defaultEmbeddings;
+    const embeddingsVectors = await embeddings.embedDocuments(
       docsWithMetadata.map((d) => d.pageContent)
     );
 
@@ -232,7 +256,7 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
 
       for (let i = 0; i < docsWithMetadata.length; i++) {
         const doc = docsWithMetadata[i];
-        const embedding = embeddings[i];
+        const embedding = embeddingsVectors[i];
         const embeddingString = `[${embedding.join(",")}]`;
         const isFirstChunk = doc.metadata.isFirstChunk as boolean | undefined;
 
@@ -298,14 +322,18 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
     query: string,
     userId: number,
     k: number = 5,
-    minSimilarity: number = 0.3
+    minSimilarity: number = 0.3,
+    apiKey?: string
   ): Promise<SearchResult[]> {
     await this.ensureInitialized();
 
     const startTime = Date.now();
 
-    // 生成查询向量
-    const queryEmbedding = await this.embeddings.embedQuery(query);
+    // 生成查询向量（使用传入的 API key 或默认的）
+    const embeddings = apiKey
+      ? this.createEmbeddings(apiKey)
+      : this.defaultEmbeddings;
+    const queryEmbedding = await embeddings.embedQuery(query);
     const queryEmbeddingString = `[${queryEmbedding.join(",")}]`;
 
     // 直接使用 SQL 查询,因为我们没有 metadata 列来使用 PGVectorStore 的 filter 功能
@@ -347,9 +375,10 @@ export class VectorStoreService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * 获取 Embeddings 实例
+   * @param apiKey 可选的 API key，如果不提供则返回默认实例
    */
-  getEmbeddings(): OpenAIEmbeddings {
-    return this.embeddings;
+  getEmbeddings(apiKey?: string): OpenAIEmbeddings {
+    return apiKey ? this.createEmbeddings(apiKey) : this.defaultEmbeddings;
   }
 
   /**
