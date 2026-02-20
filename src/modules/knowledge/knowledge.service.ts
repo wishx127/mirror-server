@@ -1,11 +1,22 @@
-import { Injectable, BadRequestException, Inject, forwardRef, Logger } from "@nestjs/common";
+import {
+  Injectable,
+  BadRequestException,
+  Inject,
+  forwardRef,
+  Logger,
+} from "@nestjs/common";
 import { Prisma } from "@prisma/client";
 import { PrismaService } from "../prisma/prisma.service";
 import { ConfigService } from "@nestjs/config";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { Document } from "@langchain/core/documents";
 import { VectorStoreService } from "./vectorstore.service";
-import { HybridRetriever, HybridRetrieverOptions, SearchResult } from "./retrievers/hybrid.retriever";
+import {
+  HybridRetriever,
+  HybridRetrieverOptions,
+  SearchResult,
+} from "./retrievers/hybrid.retriever";
+import { BM25IndexService, BM25Document } from "./bm25-index.service";
 import { DocumentLoaderFactory } from "./loaders/document-loader.factory";
 import WordExtractor from "word-extractor";
 import pdf from "pdf-parse";
@@ -60,15 +71,19 @@ export interface KnowledgeListItem {
 }
 
 // Polyfill for pdf-parse in Node.js environment
-if (typeof global.DOMMatrix === "undefined") {
-  // @ts-expect-error DOMMatrix polyfill for Node.js environment
-  global.DOMMatrix = class DOMMatrix {
+interface GlobalWithDOMMatrix {
+  DOMMatrix: new () => object;
+}
+
+const globalObj = global as unknown as GlobalWithDOMMatrix;
+if (typeof globalObj.DOMMatrix === "undefined") {
+  globalObj.DOMMatrix = class DOMMatrix {
     constructor() {}
   };
 }
 
 // 提取错误信息的辅助函数
-function getErrorMessage(error: Error | string): string {
+function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
@@ -107,7 +122,8 @@ export class KnowledgeService {
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     @Inject(forwardRef(() => VectorStoreService))
-    private readonly vectorStoreService: VectorStoreService
+    private readonly vectorStoreService: VectorStoreService,
+    private readonly bm25IndexService: BM25IndexService,
   ) {}
 
   /**
@@ -124,7 +140,9 @@ export class KnowledgeService {
       "";
 
     if (!apiKey) {
-      throw new BadRequestException("未配置 API Key，请先在设置中配置您的 API Key");
+      throw new BadRequestException(
+        "未配置 API Key，请先在设置中配置您的 API Key",
+      );
     }
 
     return apiKey;
@@ -138,7 +156,7 @@ export class KnowledgeService {
     const originalname = sanitizeString(
       file.originalname
         ? Buffer.from(file.originalname, "latin1").toString("utf8")
-        : ""
+        : "",
     );
     const fileExtension = originalname.split(".").pop()?.toLowerCase() || "";
 
@@ -173,7 +191,7 @@ export class KnowledgeService {
             }
           } catch {
             throw new BadRequestException(
-              "Word 文件解析失败：文件格式可能已损坏，或者不是有效的 .doc/.docx 文档"
+              "Word 文件解析失败：文件格式可能已损坏，或者不是有效的 .doc/.docx 文档",
             );
           }
         }
@@ -202,7 +220,7 @@ export class KnowledgeService {
       const preview = sanitizeString(
         fileExtension === "md"
           ? fullText.slice(0, 200)
-          : fullText.replace(/[ \t]+/g, "").slice(0, 200)
+          : fullText.replace(/[ \t]+/g, "").slice(0, 200),
       );
 
       // 优化显示的文件类型
@@ -241,8 +259,36 @@ export class KnowledgeService {
           fileData: fileBuffer,
           isFirstChunk: true,
         },
-        apiKey
+        apiKey,
       );
+
+      // 5. 增量添加到 BM25 索引
+      if (this.bm25IndexService.hasIndex(userId)) {
+        // 获取刚添加的文档 ID
+        const addedDocs = await this.prisma.knowledge.findMany({
+          where: {
+            userId,
+            fileName: originalname,
+          },
+          select: {
+            id: true,
+            content: true,
+            fileName: true,
+            preview: true,
+          },
+          orderBy: { id: "asc" },
+        });
+
+        for (const doc of addedDocs) {
+          await this.bm25IndexService.addDocument(userId, {
+            id: String(doc.id),
+            content: doc.content,
+            fileName: doc.fileName,
+            preview: doc.preview,
+          });
+        }
+        this.logger.debug(`Added ${addedDocs.length} documents to BM25 index`);
+      }
 
       return {
         success: true,
@@ -251,9 +297,7 @@ export class KnowledgeService {
         chunks: splitDocs.length,
       };
     } catch (error) {
-      throw new BadRequestException(
-        `处理文件失败: ${getErrorMessage(error as Error | string)}`
-      );
+      throw new BadRequestException(`处理文件失败: ${getErrorMessage(error)}`);
     }
   }
 
@@ -269,7 +313,7 @@ export class KnowledgeService {
     const originalname = sanitizeString(
       file.originalname
         ? Buffer.from(file.originalname, "latin1").toString("utf8")
-        : ""
+        : "",
     );
     const fileExtension = originalname.split(".").pop()?.toLowerCase() || "";
 
@@ -289,7 +333,7 @@ export class KnowledgeService {
       const loaderResult = await DocumentLoaderFactory.loadDocument(
         fileBuffer,
         originalname,
-        fileExtension
+        fileExtension,
       );
 
       if (
@@ -300,19 +344,22 @@ export class KnowledgeService {
       }
 
       // 附加元数据
-      const docs = DocumentLoaderFactory.attachMetadata(loaderResult.documents, {
-        fileName: originalname,
-        fileSize: file.size,
-        fileType: fileExtension,
-        uploadTime: new Date(),
-      });
+      const docs = DocumentLoaderFactory.attachMetadata(
+        loaderResult.documents,
+        {
+          fileName: originalname,
+          fileSize: file.size,
+          fileType: fileExtension,
+          uploadTime: new Date(),
+        },
+      );
 
       // 生成预览内容
       const fullText = docs.map((d) => d.pageContent).join("\n");
       const preview = sanitizeString(
         fileExtension === "md"
           ? fullText.slice(0, 200)
-          : fullText.replace(/[ \t]+/g, "").slice(0, 200)
+          : fullText.replace(/[ \t]+/g, "").slice(0, 200),
       );
 
       const displayType = this.getDisplayType(fileExtension, file.mimetype);
@@ -346,11 +393,38 @@ export class KnowledgeService {
           fileData: fileBuffer,
           isFirstChunk: true,
         },
-        apiKey
+        apiKey,
       );
 
+      // 5. 增量添加到 BM25 索引
+      if (this.bm25IndexService.hasIndex(userId)) {
+        // 获取刚添加的文档
+        const addedDocs = await this.prisma.knowledge.findMany({
+          where: {
+            userId,
+            fileName: originalname,
+          },
+          select: {
+            id: true,
+            content: true,
+            fileName: true,
+            preview: true,
+          },
+          orderBy: { id: "asc" },
+        });
+
+        for (const doc of addedDocs) {
+          await this.bm25IndexService.addDocument(userId, {
+            id: String(doc.id),
+            content: doc.content,
+            fileName: doc.fileName,
+            preview: doc.preview,
+          });
+        }
+      }
+
       this.logger.log(
-        `File uploaded with DocumentLoader: ${originalname}, ${splitDocs.length} chunks`
+        `File uploaded with DocumentLoader: ${originalname}, ${splitDocs.length} chunks`,
       );
 
       return {
@@ -362,9 +436,7 @@ export class KnowledgeService {
         wordCount: loaderResult.wordCount,
       };
     } catch (error) {
-      throw new BadRequestException(
-        `处理文件失败: ${getErrorMessage(error as Error | string)}`
-      );
+      throw new BadRequestException(`处理文件失败: ${getErrorMessage(error)}`);
     }
   }
 
@@ -386,7 +458,7 @@ export class KnowledgeService {
     userId: number,
     query: string,
     limit: number = 5,
-    minSimilarity: number = 0.3
+    minSimilarity: number = 0.3,
   ) {
     try {
       // 获取用户的 API key
@@ -402,7 +474,7 @@ export class KnowledgeService {
       const mergedResults = this.mergeResultsWithRRF(
         vectorResults,
         keywordResults,
-        limit
+        limit,
       );
 
       mergedResults.forEach((res, index) => {
@@ -410,60 +482,42 @@ export class KnowledgeService {
           `[混合搜索] 结果 ${index + 1}: ${res.fileName}, ` +
             `向量相似度: ${res.similarity?.toFixed(3)}, ` +
             `关键词得分: ${res.keywordScore?.toFixed(3)}, ` +
-            `混合得分: ${res.hybridScore?.toFixed(3)}`
+            `混合得分: ${res.hybridScore?.toFixed(3)}`,
         );
       });
 
       return { success: true, results: mergedResults };
     } catch (error) {
-      throw new BadRequestException(
-        `搜索失败: ${getErrorMessage(error as Error | string)}`
-      );
+      throw new BadRequestException(`搜索失败: ${getErrorMessage(error)}`);
     }
   }
 
   /**
    * 使用 HybridRetriever 进行混合检索
    * 这是新的推荐搜索方法，使用 LangChain Retriever 接口
+   * 支持 BM25 重排序选项
    */
   async searchWithRetriever(
     userId: number,
     query: string,
-    options: HybridRetrieverOptions = {}
+    options: HybridRetrieverOptions = {},
   ): Promise<{ success: boolean; results: SearchResult[] }> {
     try {
-      // 获取用户的 API key
-      const apiKey = await this.getApiKey(userId);
-
-      const pool = this.vectorStoreService.getPool() as import("pg").Pool;
-      if (!pool) {
-        throw new Error("Database pool not initialized");
-      }
-
-      const retriever = new HybridRetriever(
-        pool,
-        this.vectorStoreService.getEmbeddings(apiKey),
+      const retriever: HybridRetriever = await this.createRetriever(
         userId,
-        {
-          limit: options.limit ?? 5,
-          minSimilarity: options.minSimilarity ?? 0.3,
-          rrfK: options.rrfK ?? 60,
-          vectorWeight: options.vectorWeight ?? 0.7,
-          keywordWeight: options.keywordWeight ?? 0.3,
-        }
+        options,
       );
 
-      const results = await retriever.getSearchResults(query);
+      const results: SearchResult[] = await retriever.getSearchResults(query);
 
       this.logger.log(
-        `HybridRetriever search completed, returned ${results.length} results`
+        `HybridRetriever search completed, returned ${results.length} results` +
+          (options.useBM25Rerank ? " (with BM25 rerank)" : ""),
       );
 
       return { success: true, results };
     } catch (error) {
-      throw new BadRequestException(
-        `搜索失败: ${getErrorMessage(error as Error | string)}`
-      );
+      throw new BadRequestException(`搜索失败: ${getErrorMessage(error)}`);
     }
   }
 
@@ -473,7 +527,7 @@ export class KnowledgeService {
    */
   async createRetriever(
     userId: number,
-    options: HybridRetrieverOptions = {}
+    options: HybridRetrieverOptions = {},
   ): Promise<HybridRetriever> {
     // 获取用户的 API key
     const apiKey = await this.getApiKey(userId);
@@ -483,12 +537,84 @@ export class KnowledgeService {
       throw new Error("Database pool not initialized");
     }
 
+    // 如果启用 BM25 重排序，确保索引存在
+    if (options.useBM25Rerank) {
+      await this.ensureBM25Index(userId);
+    }
+
     return new HybridRetriever(
       pool,
       this.vectorStoreService.getEmbeddings(apiKey),
       userId,
-      options
+      {
+        ...options,
+        bm25IndexService: options.useBM25Rerank
+          ? this.bm25IndexService
+          : undefined,
+      },
     );
+  }
+
+  /**
+   * 确保用户有 BM25 索引
+   * 如果没有，从数据库构建索引
+   */
+  private async ensureBM25Index(userId: number): Promise<void> {
+    if (this.bm25IndexService.hasIndex(userId)) {
+      return;
+    }
+
+    this.logger.log(`Building BM25 index for user ${userId}...`);
+
+    // 从数据库获取所有知识库文档
+    const documents = await this.prisma.knowledge.findMany({
+      where: { userId },
+      select: {
+        id: true,
+        content: true,
+        fileName: true,
+        preview: true,
+        size: true,
+        type: true,
+      },
+    });
+
+    if (documents.length === 0) {
+      return;
+    }
+
+    // 转换为 BM25Document 格式
+    const bm25Docs: BM25Document[] = documents.map((doc) => ({
+      id: String(doc.id),
+      content: doc.content,
+      fileName: doc.fileName,
+      preview: doc.preview,
+      metadata: {
+        size: doc.size,
+        type: doc.type,
+      },
+    }));
+
+    // 构建索引
+    await this.bm25IndexService.buildIndex(userId, bm25Docs);
+  }
+
+  /**
+   * 更新 BM25 索引（增量添加文档）
+   */
+  async updateBM25Index(userId: number, document: BM25Document): Promise<void> {
+    if (this.bm25IndexService.hasIndex(userId)) {
+      await this.bm25IndexService.addDocument(userId, document);
+    }
+  }
+
+  /**
+   * 从 BM25 索引中删除文档
+   */
+  removeFromBM25Index(userId: number, documentId: string): Promise<void> {
+    if (this.bm25IndexService.hasIndex(userId)) {
+      this.bm25IndexService.removeDocument(userId, documentId);
+    }
   }
 
   /**
@@ -499,7 +625,7 @@ export class KnowledgeService {
     query: string,
     limit: number,
     minSimilarity: number,
-    apiKey: string
+    apiKey: string,
   ): Promise<VectorSearchResult[]> {
     // 使用 VectorStoreService 进行向量检索
     const results = await this.vectorStoreService.similaritySearch(
@@ -507,7 +633,7 @@ export class KnowledgeService {
       userId,
       limit,
       minSimilarity,
-      apiKey
+      apiKey,
     );
 
     // 转换为 VectorSearchResult 格式
@@ -515,7 +641,13 @@ export class KnowledgeService {
     const ids = results.map((r) => r.id);
     const records = await this.prisma.knowledge.findMany({
       where: { id: { in: ids } },
-      select: { id: true, fileName: true, preview: true, size: true, type: true },
+      select: {
+        id: true,
+        fileName: true,
+        preview: true,
+        size: true,
+        type: true,
+      },
     });
 
     const recordMap = new Map(records.map((r) => [r.id, r]));
@@ -541,7 +673,7 @@ export class KnowledgeService {
   private async keywordSearch(
     userId: number,
     query: string,
-    limit: number
+    limit: number,
   ): Promise<KeywordSearchResult[]> {
     // 提取关键词
     const keywords = this.extractKeywords(query);
@@ -555,7 +687,7 @@ export class KnowledgeService {
     const keywordConditions = keywords
       .map(
         (kw) =>
-          `CASE WHEN content ILIKE '%${this.escapeSQL(kw)}%' THEN 1 ELSE 0 END`
+          `CASE WHEN content ILIKE '%${this.escapeSQL(kw)}%' THEN 1 ELSE 0 END`,
       )
       .join(" + ");
 
@@ -749,7 +881,7 @@ export class KnowledgeService {
     const words: string[] = [];
 
     // 英文单词提取
-    const englishWords = query.match(/[a-zA-Z]+/g) || [];
+    const englishWords: string[] = query.match(/[a-zA-Z]+/g) || [];
     englishWords.forEach((word) => {
       const lowerWord = word.toLowerCase();
       if (lowerWord.length >= 2 && !stopWords.has(lowerWord)) {
@@ -758,7 +890,7 @@ export class KnowledgeService {
     });
 
     // 中文词组提取（使用简单的N-gram方法）
-    const chineseChars = query.match(/[\u4e00-\u9fa5]+/g) || [];
+    const chineseChars: string[] = query.match(/[\u4e00-\u9fa5]+/g) || [];
     chineseChars.forEach((segment) => {
       // 对于中文，提取2-4字的词组
       for (let len = 2; len <= Math.min(4, segment.length); len++) {
@@ -798,7 +930,7 @@ export class KnowledgeService {
     limit: number,
     k: number = 60,
     vectorWeight: number = 0.7, // 向量检索权重
-    keywordWeight: number = 0.3 // 关键词检索权重
+    keywordWeight: number = 0.3, // 关键词检索权重
   ): KnowledgeSearchResult[] {
     const scoreMap = new Map<
       number,
@@ -877,7 +1009,7 @@ export class KnowledgeService {
     userId: number,
     page: number = 1,
     pageSize: number = 10,
-    types?: number[]
+    types?: number[],
   ) {
     try {
       const skip = (page - 1) * pageSize;
@@ -959,9 +1091,7 @@ export class KnowledgeService {
         },
       };
     } catch (error) {
-      throw new BadRequestException(
-        `获取列表失败: ${getErrorMessage(error as Error | string)}`
-      );
+      throw new BadRequestException(`获取列表失败: ${getErrorMessage(error)}`);
     }
   }
 
@@ -979,6 +1109,16 @@ export class KnowledgeService {
         throw new BadRequestException("文件不存在");
       }
 
+      // 获取要删除的所有文档 ID
+      const documentsToDelete = await this.prisma.knowledge.findMany({
+        where: {
+          userId,
+          fileName,
+        },
+        select: { id: true },
+      });
+
+      // 删除数据库记录
       await this.prisma.knowledge.deleteMany({
         where: {
           userId,
@@ -986,14 +1126,22 @@ export class KnowledgeService {
         },
       });
 
+      // 从 BM25 索引中删除文档
+      if (this.bm25IndexService.hasIndex(userId)) {
+        for (const doc of documentsToDelete) {
+          this.bm25IndexService.removeDocument(userId, String(doc.id));
+        }
+        this.logger.debug(
+          `Removed ${documentsToDelete.length} documents from BM25 index`,
+        );
+      }
+
       return {
         success: true,
         message: `删除成功`,
       };
     } catch (error) {
-      throw new BadRequestException(
-        `删除文件失败: ${getErrorMessage(error as Error | string)}`
-      );
+      throw new BadRequestException(`删除文件失败: ${getErrorMessage(error)}`);
     }
   }
 
@@ -1036,7 +1184,7 @@ export class KnowledgeService {
       };
     } catch (error) {
       throw new BadRequestException(
-        `获取文件详情失败: ${getErrorMessage(error as Error | string)}`
+        `获取文件详情失败: ${getErrorMessage(error)}`,
       );
     }
   }
@@ -1115,9 +1263,7 @@ export class KnowledgeService {
       if (error instanceof BadRequestException) {
         throw error;
       }
-      throw new BadRequestException(
-        `下载文件失败: ${getErrorMessage(error as Error | string)}`
-      );
+      throw new BadRequestException(`下载文件失败: ${getErrorMessage(error)}`);
     }
   }
 
