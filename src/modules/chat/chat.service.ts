@@ -28,6 +28,7 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
 import { RAGChainFactory } from "./chains/rag-chain.factory";
+import { PrismaChatMessageHistory } from "./memory/prisma-chat-message-history";
 
 // OpenAI 流式响应 delta 类型
 interface StreamDelta {
@@ -111,14 +112,18 @@ export class ChatService {
   /**
    * 创建 ChatOpenAI 实例
    */
-  private createChatOpenAI(apiKey: string, baseURL: string, modelName: string): ChatOpenAI {
+  private createChatOpenAI(
+    apiKey: string,
+    baseURL: string,
+    modelName: string,
+  ): ChatOpenAI {
     // 临时设置环境变量，确保 LangChain 在任何地方都能获取到 apiKey
     // 这是解决 stream 模式下 apiKey 丢失问题的最可靠方法
     process.env.OPENAI_API_KEY = apiKey;
     if (baseURL) {
       process.env.OPENAI_BASE_URL = baseURL;
     }
-    
+
     return new ChatOpenAI({
       openAIApiKey: apiKey,
       model: modelName,
@@ -134,7 +139,10 @@ export class ChatService {
     return messages
       .filter((msg) => msg.role !== "system") // 系统消息在 RAG Chain 中单独处理
       .map((msg) => {
-        const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+        const content =
+          typeof msg.content === "string"
+            ? msg.content
+            : JSON.stringify(msg.content);
         if (msg.role === "user") {
           return new HumanMessage(content);
         } else if (msg.role === "assistant") {
@@ -189,6 +197,8 @@ export class ChatService {
     options: {
       topK?: number;
       minSimilarity?: number;
+      useMemory?: boolean;
+      chatId?: string;
     } = {},
   ): Promise<{
     observable: Observable<ChatSseEvent>;
@@ -196,7 +206,12 @@ export class ChatService {
     assistantKey: string;
     assistantTime: string;
   }> {
-    const { topK = 5, minSimilarity = 0.2 } = options;
+    const {
+      topK = 5,
+      minSimilarity = 0.2,
+      useMemory = false,
+      chatId,
+    } = options;
     const assistantKey = this.getRandomKey();
     const assistantTime = this.formatChineseTime(new Date());
     const fullReplyRef = { value: "" };
@@ -207,7 +222,9 @@ export class ChatService {
       minSimilarity,
     });
 
-    this.logger.log(`Creating ChatOpenAI with apiKey: ${apiKey ? 'provided' : 'MISSING'}, baseURL: ${baseURL || 'MISSING'}, model: ${modelName}`);
+    this.logger.log(
+      `Creating ChatOpenAI with apiKey: ${apiKey ? "provided" : "MISSING"}, baseURL: ${baseURL || "MISSING"}, model: ${modelName}`,
+    );
 
     // 2. 创建 ChatOpenAI 实例
     const llm = this.createChatOpenAI(apiKey, baseURL, modelName);
@@ -217,46 +234,63 @@ export class ChatService {
       llm,
       retriever,
       systemPrompt,
+      useMemory,
+      useMemory
+        ? (sessionId: string) => {
+            return new PrismaChatMessageHistory({
+              sessionId,
+              userId,
+              prismaService: this.prisma,
+            });
+          }
+        : undefined,
     );
 
     this.logger.log(`RAG Chain created successfully for user ${userId}`);
 
     // 4. 执行流式调用并转换为 Observable
-    const observable = new Observable((subscriber: Subscriber<ChatSseEvent>) => {
-      void (async () => {
-        try {
-          const stream = await ragChain.stream({
-            input: query,
-            chat_history: chatHistory,
-          });
+    const observable = new Observable(
+      (subscriber: Subscriber<ChatSseEvent>) => {
+        void (async () => {
+          try {
+            const stream = await ragChain.stream(
+              {
+                input: query,
+                chat_history: useMemory ? undefined : chatHistory,
+              },
+              useMemory && chatId
+                ? { configurable: { sessionId: chatId } }
+                : undefined,
+            );
 
-          for await (const chunk of stream) {
-            // chunk 是字符串片段
-            if (chunk) {
-              fullReplyRef.value += chunk;
-              subscriber.next({
-                data: {
-                  content: chunk,
-                  reasoningContent: "",
-                  isFinishThinking: true,
-                  chatId: undefined,
-                  key: assistantKey,
-                  time: assistantTime,
-                },
-              });
+            for await (const chunk of stream) {
+              // chunk 是字符串片段
+              if (chunk) {
+                fullReplyRef.value += chunk as string;
+                subscriber.next({
+                  data: {
+                    content: chunk as string,
+                    reasoningContent: "",
+                    isFinishThinking: true,
+                    chatId: undefined,
+                    key: assistantKey,
+                    time: assistantTime,
+                  },
+                });
+              }
             }
-          }
 
-          subscriber.complete();
-        } catch (error: unknown) {
-          const message = error instanceof Error ? error.message : "未知错误";
-          this.logger.error(`RAG Chain stream error: ${message}`);
-          subscriber.error(
-            new BadRequestException(`RAG Chain 流式调用失败: ${message}`),
-          );
-        }
-      })();
-    });
+            subscriber.complete();
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : "未知错误";
+            this.logger.error(`RAG Chain stream error: ${message}`);
+            subscriber.error(
+              new BadRequestException(`RAG Chain 流式调用失败: ${message}`),
+            );
+          }
+        })();
+      },
+    );
 
     return { observable, fullReplyRef, assistantKey, assistantTime };
   }
@@ -306,10 +340,7 @@ export class ChatService {
         await tx.conversationDetail.update({
           where: { id: existingDetail.id },
           data: {
-            content: [
-              ...currentContent,
-              ...newMessages,
-            ] as unknown as object[],
+            content: [...currentContent, ...newMessages] as unknown as object[],
           },
         });
       } else {
@@ -516,7 +547,15 @@ export class ChatService {
     }
 
     // 3. 判断是否使用 RAG Chain（启用知识库且有用户ID）
-    const useRAGChain = dto.enableKnowledge && userId && !dto.images?.length && !dto.files?.length;
+    const useRAGChain =
+      dto.enableKnowledge &&
+      userId &&
+      !dto.images?.length &&
+      !dto.files?.length;
+
+    // 获取 LangChain Memory 配置
+    const useLangChainMemory =
+      this.configService.get<string>("USE_LANGCHAIN_MEMORY") === "true";
 
     // if (!useRAGChain && dto.enableKnowledge && userId) {
     //   const searchResult = await this.knowledgeService.search(
@@ -800,6 +839,8 @@ export class ChatService {
         {
           topK: dto.topK ?? 5,
           minSimilarity: dto.minSimilarity ?? 0.2,
+          useMemory: useLangChainMemory,
+          chatId: chatId || undefined,
         },
       );
 
@@ -815,40 +856,57 @@ export class ChatService {
               event.data.chatId = chatId || undefined;
               subscriber.next(event);
             },
-            complete: async () => {
+            complete: () => {
               // 保存消息到数据库
               if (userId && chatId) {
-                const assistantContent: StoredMessageContentPart[] = [];
-                if (fullReply) {
-                  assistantContent.push({ type: "content", data: fullReply });
+                if (useLangChainMemory) {
+                  // 如果启用了 LangChain Memory，消息保存由 Memory 自动处理
+                  // 但如果是新对话，我们需要更新标题
+                  if (isNewConversation) {
+                    const title = await this.generateConversationTitle(
+                      apiKey,
+                      baseURL,
+                      modelName,
+                      dto.content,
+                    );
+                    await this.prisma.userConversation.update({
+                      where: { id: chatId },
+                      data: { title },
+                    });
+                  }
+                } else {
+                  const assistantContent: StoredMessageContentPart[] = [];
+                  if (fullReply) {
+                    assistantContent.push({ type: "content", data: fullReply });
+                  }
+
+                  const newMessages: StoredMessage[] = [
+                    {
+                      role: "user",
+                      content: userMessage.content,
+                      key: userMessage.key,
+                      time: userMessage.time,
+                    },
+                    {
+                      role: "assistant",
+                      content: assistantContent,
+                      key: ragResult.assistantKey,
+                      time: ragResult.assistantTime,
+                      isFinishThinking: true,
+                    },
+                  ];
+
+                  await this.saveConversation(
+                    userId,
+                    chatId,
+                    isNewConversation,
+                    newMessages,
+                    apiKey,
+                    baseURL,
+                    modelName,
+                    dto.content,
+                  );
                 }
-
-                const newMessages: StoredMessage[] = [
-                  {
-                    role: "user",
-                    content: userMessage.content,
-                    key: userMessage.key,
-                    time: userMessage.time,
-                  },
-                  {
-                    role: "assistant",
-                    content: assistantContent,
-                    key: ragResult.assistantKey,
-                    time: ragResult.assistantTime,
-                    isFinishThinking: true,
-                  },
-                ];
-
-                await this.saveConversation(
-                  userId,
-                  chatId,
-                  isNewConversation,
-                  newMessages,
-                  apiKey,
-                  baseURL,
-                  modelName,
-                  dto.content,
-                );
               }
               subscriber.complete();
             },
@@ -923,7 +981,6 @@ export class ChatService {
             });
           }
 
-
           // 6. 只有已登录用户才保存对话详情
           if (userId && chatId) {
             const assistantContent: StoredMessageContentPart[] = [];
@@ -994,7 +1051,9 @@ export class ChatService {
 
     try {
       const sharpModule = await import("sharp");
-      const sharp = sharpModule.default;
+      const sharp = (
+        sharpModule as unknown as { default: typeof import("sharp") }
+      ).default;
 
       let pipeline = sharp(buffer);
       const metadata = await pipeline.metadata();
@@ -1207,7 +1266,10 @@ export class ChatService {
     let height: number | undefined;
     try {
       const sharpModule = await import("sharp");
-      const metadata = await sharpModule.default(compressedBuffer).metadata();
+      const sharp = (
+        sharpModule as unknown as { default: typeof import("sharp") }
+      ).default;
+      const metadata = await sharp(compressedBuffer).metadata();
       width = metadata.width;
       height = metadata.height;
     } catch {
