@@ -1,18 +1,5 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "src/main.ts",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": [
-          "prisma/**",
-          "uploads/**",
-          "cache/**"
-        ]
-      }
-    }
-  ],
   "routes": [
     {
       "src": "/(.*)",
@@ -23,6 +10,11 @@
     "NODE_ENV": "production",
     "VERCEL": "1"
   },
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist"
+  "git": {
+    "deploymentEnabled": {
+      "main": true,
+      "master": true,
+      "develop": false
+    }
+  }
 }
