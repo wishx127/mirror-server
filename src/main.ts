@@ -8,6 +8,7 @@ import { NestExpressApplication } from "@nestjs/platform-express";
 import { readdirSync, unlinkSync } from "fs";
 import { Request, Response, NextFunction, json, urlencoded } from "express";
 import cookieParser from "cookie-parser";
+import serverless from "serverless-http";
 
 // 扩展 Request 类型以包含 rawBody
 interface RawBodyRequest extends Request {
@@ -40,8 +41,7 @@ function clearCacheDirectory() {
   }
 }
 
-async function bootstrap() {
-  // 创建Nest应用(根模块)
+async function createApp() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
   // 增大 Payload 限制，支持大文件上传
@@ -77,7 +77,7 @@ async function bootstrap() {
       } else {
         next();
       }
-    }
+    },
   );
 
   // 配置静态文件服务
@@ -90,7 +90,7 @@ async function bootstrap() {
         return;
       }
       next();
-    }
+    },
   );
 
   app.use(
@@ -102,7 +102,7 @@ async function bootstrap() {
         return;
       }
       next();
-    }
+    },
   );
 
   // 提供静态文件服务
@@ -139,6 +139,45 @@ async function bootstrap() {
     });
   });
 
+  return app;
+}
+const isServerless =
+  process.env.VERCEL === "1" || process.env.SERVERLESS === "1";
+
+async function bootstrap() {
+  const app = await createApp();
+
+  process.on("SIGINT", () => {
+    clearCacheDirectory();
+    void app.close().then(() => {
+      process.exit(0);
+    });
+  });
+
+  process.on("SIGTERM", () => {
+    clearCacheDirectory();
+    void app.close().then(() => {
+      process.exit(0);
+    });
+  });
+
   await app.listen(process.env.PORT ?? 3000, "0.0.0.0");
 }
-void bootstrap();
+
+let cachedHandler: ((req: Request, res: Response) => Promise<void>) | null =
+  null;
+
+export default async function handler(req: Request, res: Response) {
+  if (!cachedHandler) {
+    const app = await createApp();
+    await app.init();
+    const instance = app.getHttpAdapter().getInstance();
+    cachedHandler = serverless(instance);
+  }
+
+  return cachedHandler(req, res);
+}
+
+if (!isServerless) {
+  void bootstrap();
+}
