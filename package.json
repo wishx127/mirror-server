@@ -54,6 +54,7 @@
     "pg": "^8.16.3",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "serverless-http": "^4.0.0",
     "sharp": "^0.34.5",
     "tencentcloud-sdk-nodejs-asr": "^4.1.138",
     "tencentcloud-sdk-nodejs-tts": "^4.1.117",

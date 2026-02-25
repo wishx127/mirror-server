@@ -31,6 +31,10 @@ test-*
 *.launch
 .settings/
 *.sublime-workspace
+.codebuddy
+.codex
+.kilocode
+.trae
 
 # IDE - VSCode
 .vscode/*
