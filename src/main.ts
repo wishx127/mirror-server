@@ -164,8 +164,7 @@ async function bootstrap() {
   await app.listen(process.env.PORT ?? 3000, "0.0.0.0");
 }
 
-let cachedHandler: ((req: Request, res: Response) => Promise<void>) | null =
-  null;
+let cachedHandler: ReturnType<typeof serverless> | undefined = undefined;
 
 export default async function handler(req: Request, res: Response) {
   if (!cachedHandler) {
@@ -175,7 +174,9 @@ export default async function handler(req: Request, res: Response) {
     cachedHandler = serverless(instance);
   }
 
-  return cachedHandler(req, res);
+  if (cachedHandler) {
+    return cachedHandler(req, res);
+  }
 }
 
 if (!isServerless) {
